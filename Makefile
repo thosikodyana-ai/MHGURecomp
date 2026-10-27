@@ -18,7 +18,7 @@ B        ?= build
 O        ?= obj
 CC       := clang
 CXX      := clang++
-GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA (Haswell or newer)
+GENARCH  ?= -march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2  # AMD A10-7800 (Steamroller) / Non-AVX2
 GENFLAGS := -O1 -fno-strict-aliasing -ffp-contract=off -fno-math-errno -Wno-return-type -Wno-unused-label \
             -Wno-parentheses-equality -Wno-unused-value -fvisibility=hidden -Iruntime $(GENARCH)
 
@@ -46,7 +46,7 @@ FFMPEG_LIBS   := $(addprefix $(FFMPEG_DIR)/lib/,libavformat.a libavcodec.a libav
 FFMPEG_CONF   := --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
                  --disable-debug --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample \
                  --enable-static --disable-shared --enable-protocol=file --enable-demuxer=mov \
-                 --enable-parser=h264,aac --enable-decoder=h264,aac
+                 --enable-parser=h264,aac --enable-decoder=h264,aac --disable-avx2 --disable-avx512
 # (nasm: FFmpeg's assembly for x86; without it the plain C versions, fast enough for 960x540 movies)
 FFMPEG_CONF   += $(if $(shell command -v nasm 2>/dev/null),,--disable-x86asm)
 ifeq ($(FFMPEG),system)
@@ -89,10 +89,10 @@ IMGUI    := third_party/cimgui
 IMGUI_SRC := $(IMGUI)/cimgui.cpp $(addprefix $(IMGUI)/imgui/,imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp imgui_demo.cpp)
 IMGUI_SRC += $(if $(filter 1,$(NULL_GPU)),,$(IMGUI)/imgui/backends/imgui_impl_vulkan.cpp)
 IMGUI_OBJ := $(patsubst $(IMGUI)/%.cpp,$(O)/imgui/%.o,$(IMGUI_SRC))
-IMGUIFLAGS := -O2 -g -DCIMGUI_NO_EXPORT -I$(IMGUI) -I$(IMGUI)/imgui
+IMGUIFLAGS := -O2 -g -DCIMGUI_NO_EXPORT -I$(IMGUI) -I$(IMGUI)/imgui $(GENARCH)
 # (vendored VulkanMemoryAllocator fallback: -I on a missing dir is ignored, so MSYS2 builds
 # with the system vulkan-memory-allocator package are unaffected)
-RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Ithird_party/vk_mem_alloc -I$(IMGUI) $(OSFLAGS)
+RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Ithird_party/vk_mem_alloc -I$(IMGUI) $(OSFLAGS) $(GENARCH)
 # NULL_GPU=1: no renderer (runtime/nvn/backend_null.c: the game runs, nothing is drawn)
 ifeq ($(NULL_GPU),1)
 RTFLAGS  += -DMHGU_NULL_BACKEND
@@ -136,7 +136,7 @@ $(O)/imgui/%.o: $(IMGUI)/%.cpp
 
 $(O)/rt/nvn/vulkan/vma.o: runtime/nvn/vulkan/vma.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -O2 -w -Ithird_party/vk_mem_alloc -c $< -o $@
+	$(CXX) -O2 -w $(GENARCH) -Ithird_party/vk_mem_alloc -c $< -o $@
 
 $(EXE): $(RT_OBJ) $(AV_DEPS)
 	@mkdir -p $(dir $@)

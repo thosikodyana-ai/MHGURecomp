@@ -39,10 +39,11 @@ bool gamelib_load(char *why, size_t why_size) {
 #endif
     if (!entry) { snprintf(why, why_size, "%s: not game code", path); return false; }
     const GameLibTables *t = entry();
-    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, GAMELIB_ID)) {
+    if (!t || t->abi != GAMELIB_ABI || !t->id) {
         snprintf(why, why_size, "%s was built for another version of the runtime: rebuild it (make)", path);
         return false;
     }
+    if (strcmp(t->id, GAMELIB_ID) != 0) { LOG("[gamelib] Non-AVX2 compatibility: loaded game library id %s (runtime id %s)\n", t->id, GAMELIB_ID); }
     g_tables = t;
     LOG("[gamelib] %s (%u + %u functions)\n", path, *t->main_count, *t->sdk_count);
     return true;

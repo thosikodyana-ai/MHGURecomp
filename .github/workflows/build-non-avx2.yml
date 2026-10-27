@@ -1,0 +1,95 @@
+name: Build MHGURecomp Non-AVX2 (AMD A10-7800 / bdver3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      genarch:
+        description: 'Target CPU Architecture Flags (GENARCH)'
+        required: true
+        default: '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2'
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-non-avx2:
+    name: Windows UCRT64 Non-AVX2 (AMD A10-7800)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout Patched MHGURecomp Repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 UCRT64 Toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make
+            git
+            diffutils
+            curl
+            unzip
+            zip
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-lld
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator
+
+      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + In-Process AVX2/BMI2 VEH Emulator)
+        run: |
+          TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2' }}"
+          echo "Compiling with GENARCH: $TARGET_ARCH"
+          make -j4 GENARCH="$TARGET_ARCH"
+
+      - name: Fetch Official Release 0.10.1 & Patch mhgugame.dll for AMD A10-7800
+        run: |
+          curl -fL --retry 3 -o official_release.zip https://github.com/morerokk/MHGURecomp/releases/download/0.10.1/Windows-MHGURecomp.0.10.1.zip
+          unzip -q official_release.zip -d official_rel
+          cp -f official_rel/Windows-MHGURecomp/mhgugame.dll build/mhgugame.dll
+          cp -rf official_rel/Windows-MHGURecomp/bonus build/ 2>/dev/null || true
+          cp -rf official_rel/Windows-MHGURecomp/cheats build/ 2>/dev/null || true
+          cp -rf official_rel/Windows-MHGURecomp/data build/ 2>/dev/null || true
+          cp -rf official_rel/Windows-MHGURecomp/mods build/ 2>/dev/null || true
+          python3 tools/patch_mhgugame_dll.py build/mhgugame.dll
+
+      - name: Package Ready-to-Play Non-AVX2 Zip Archive
+        run: |
+          mv build Windows-MHGURecomp-NonAVX2-A10-7800
+          zip -r9 Windows-MHGURecomp-NonAVX2-A10-7800.zip Windows-MHGURecomp-NonAVX2-A10-7800
+          ls -lh Windows-MHGURecomp-NonAVX2-A10-7800.zip
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Windows-MHGURecomp-NonAVX2-A10-7800
+          path: Windows-MHGURecomp-NonAVX2-A10-7800.zip
+          retention-days: 30
+
+      - name: Publish GitHub Release (v0.10.1-non-avx2-a10-7800)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.10.1-non-avx2-a10-7800
+          name: "MHGURecomp 0.10.1 Non-AVX2 (AMD A10-7800 / bdver3 & x86-64-v2 Edition)"
+          body: |
+            ### Native Non-AVX2 Build for AMD A10-7800 (Steamroller / bdver3) & Pre-Haswell CPUs
+            - **`mhgurecomp.exe`**: Compiled natively with `-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2` (keeps hardware AVX1 Float, FMA3, FMA4, BMI1, F16C, and SSE4.2 while eliminating AVX2/BMI2).
+            - **In-Process AVX2 & BMI2 Hardware Exception Emulator (`runtime/avx2_bmi2_veh.c`)**: Built directly into `mhgurecomp.exe` via Windows `AddVectoredExceptionHandler` to execute any remaining 256-bit integer YMM or BMI2 opcodes without `0xC000001D (Illegal Instruction)` crashes.
+            - **`mhgugame.dll` (from 0.10.1)**: Statically patched in-place (`tools/patch_mhgugame_dll.py`) for switch-table `rorx` instructions and unlocked `GAMELIB_ID` compatibility.
+          files: Windows-MHGURecomp-NonAVX2-A10-7800.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
