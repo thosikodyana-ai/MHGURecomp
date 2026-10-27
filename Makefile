@@ -18,7 +18,7 @@ B        ?= build
 O        ?= obj
 CC       := clang
 CXX      := clang++
-GENARCH  ?= -march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2  # AMD A10-7800 (Steamroller) / Non-AVX2
+GENARCH  ?= -march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe  # AMD A10-7800 (Steamroller) / Non-AVX2
 GENFLAGS := -O1 -fno-strict-aliasing -ffp-contract=off -fno-math-errno -Wno-return-type -Wno-unused-label \
             -Wno-parentheses-equality -Wno-unused-value -fvisibility=hidden -Iruntime $(GENARCH)
 

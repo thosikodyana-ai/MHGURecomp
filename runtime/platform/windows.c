@@ -213,8 +213,14 @@ void plat_print_backtrace(void) {
 static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
     EXCEPTION_RECORD *er = ep->ExceptionRecord;
     uint64_t fa = er->NumberParameters >= 2 ? er->ExceptionInformation[1] : 0;
-    char what[48];
-    snprintf(what, sizeof what, "exception %08lx", er->ExceptionCode);
+    char what[160];
+    const uint8_t *ip = (const uint8_t *)(uintptr_t)ep->ContextRecord->Rip;
+    MEMORY_BASIC_INFORMATION ip_mi;
+    if (VirtualQuery(ip, &ip_mi, sizeof ip_mi) && ip_mi.State == MEM_COMMIT)
+        snprintf(what, sizeof what, "exception %08lx [bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x]",
+                 er->ExceptionCode, ip[0], ip[1], ip[2], ip[3], ip[4], ip[5], ip[6], ip[7], ip[8], ip[9], ip[10], ip[11]);
+    else
+        snprintf(what, sizeof what, "exception %08lx", er->ExceptionCode);
     uint64_t lr = 0;
     MEMORY_BASIC_INFORMATION mi;
     if (VirtualQuery((void *)(uintptr_t)ep->ContextRecord->Rsp, &mi, sizeof mi) && mi.State == MEM_COMMIT)

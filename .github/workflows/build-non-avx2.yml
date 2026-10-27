@@ -6,7 +6,7 @@ on:
       genarch:
         description: 'Target CPU Architecture Flags (GENARCH)'
         required: true
-        default: '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2'
+        default: '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe'
   push:
     branches: [ main, master ]
 
@@ -20,7 +20,6 @@ jobs:
     defaults:
       run:
         shell: msys2 {0}
-
     steps:
       - name: Checkout Patched MHGURecomp Repository
         uses: actions/checkout@v4
@@ -48,9 +47,9 @@ jobs:
             mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-vulkan-memory-allocator
 
-      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + In-Process AVX2/BMI2 VEH Emulator)
+      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + In-Process MOVBE/AVX2/BMI2 VEH Emulator)
         run: |
-          TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2' }}"
+          TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe' }}"
           echo "Compiling with GENARCH: $TARGET_ARCH"
           make -j4 build/mhgurecomp.exe bundle licenses GEN_SRC="" GENARCH="$TARGET_ARCH"
 
@@ -82,12 +81,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.10.1-non-avx2-a10-7800
-          name: "MHGURecomp 0.10.1 Non-AVX2 (AMD A10-7800 / bdver3 & x86-64-v2 Edition)"
+          name: "MHGURecomp 0.10.1 Non-AVX2 v2 (AMD A10-7800 / bdver3 + MOVBE/AVX2/BMI2 Fix)"
           body: |
-            ### Native Non-AVX2 Build for AMD A10-7800 (Steamroller / bdver3) & Pre-Haswell CPUs
-            - **`mhgurecomp.exe`**: Compiled natively with `-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2` (keeps hardware AVX1 Float, FMA3, FMA4, BMI1, F16C, and SSE4.2 while eliminating AVX2/BMI2).
-            - **In-Process AVX2 & BMI2 Hardware Exception Emulator (`runtime/avx2_bmi2_veh.c`)**: Built directly into `mhgurecomp.exe` via Windows `AddVectoredExceptionHandler` to execute any remaining 256-bit integer YMM or BMI2 opcodes without `0xC000001D (Illegal Instruction)` crashes.
-            - **`mhgugame.dll` (from 0.10.1)**: Statically patched in-place (`tools/patch_mhgugame_dll.py`) for switch-table `rorx` instructions and unlocked `GAMELIB_ID` compatibility.
+            ### Native Non-AVX2 v2 Build for AMD A10-7800 (Steamroller / bdver3) & Pre-Haswell CPUs
+            - **Fixed Crash at `f_d8a6fc+4d7` (`exception c000001d`)**: Root-caused to `MOVBE` (`0F 38 F0` / `0F 38 F1`, e.g., `44 0f 38 f1 5e 08` -> `movbe [rsi+8], r11d`), which is part of `-march=x86-64-v3` but unsupported on AMD A10-7800 (`bdver3` / Steamroller).
+            - **`mhgurecomp.exe`**: Compiled natively with `-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe` and includes `runtime/avx2_bmi2_veh.c` supporting `MOVBE` (16/32/64-bit load & store), `BMI2`, and `AVX2` (both `L=0` 128-bit XMM and `L=1` 256-bit YMM).
+            - **`mhgugame.dll` (from 0.10.1)**: Statically patched in-place (`tools/patch_mhgugame_dll.py`) for switch-table `RORX` sites and `MOVBE + BSWAP` pairs (`f_d8a6fc+4d7`).
           files: Windows-MHGURecomp-NonAVX2-A10-7800.zip
           draft: false
           prerelease: false
