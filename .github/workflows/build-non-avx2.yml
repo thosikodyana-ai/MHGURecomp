@@ -52,7 +52,7 @@ jobs:
         run: |
           TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2' }}"
           echo "Compiling with GENARCH: $TARGET_ARCH"
-          make -j4 GENARCH="$TARGET_ARCH"
+          make -j4 build/mhgurecomp.exe bundle licenses GEN_SRC="" GENARCH="$TARGET_ARCH"
 
       - name: Fetch Official Release 0.10.1 & Patch mhgugame.dll for AMD A10-7800
         run: |
