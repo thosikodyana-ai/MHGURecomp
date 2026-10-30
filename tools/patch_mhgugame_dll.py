@@ -206,7 +206,7 @@ def emit_mem_op_from_vex_tail(opc, R, X, B, W, tail, rsp_delta=0, prefix_66=Fals
 
 LINE_RE = re.compile(r'^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s)+)\s*(.+)$')
 TARGET_RE = re.compile(r'\b(rorx|shlx|sarx|shrx|movbe|mulx|bzhi|pext|pdep|vpbroadcastd|vpbroadcastb)\b')
-BRANCH_RE = re.compile(r'\b(?:j[a-z]+|callq?)\s+0x([0-9a-fA-F]+)')
+BRANCH_RE = re.compile(r'\b(?:j[a-z]+|callq?)\s+(?:0x)?([0-9a-fA-F]+)\s*<')
 
 
 def parse_objdump_line(line):
@@ -233,7 +233,7 @@ def patch_mhgugame_dll(dll_path):
         if p is None:
             continue
         va, raw, disasm = p
-        if '0x' in disasm:
+        if '<' in disasm:
             bm = BRANCH_RE.search(disasm)
             if bm:
                 branch_targets.add(int(bm.group(1), 16))
@@ -248,7 +248,10 @@ def patch_mhgugame_dll(dll_path):
             next_i = parsed_window[i + 1] if i + 1 < len(parsed_window) else None
             records.append((prev_i, item, next_i))
 
-    print(f"[v3] Found {len(records)} non-bdver3 sites and {len(branch_targets)} nearby branch targets.")
+    global IMAGE_BASE
+    if records:
+        IMAGE_BASE = records[0][1][0] & ~0x0FFFFFFF
+    print(f"[v3] Found {len(records)} non-bdver3 sites, {len(branch_targets)} nearby branch targets, IMAGE_BASE={hex(IMAGE_BASE)}.")
 
     with open(dll_path, 'rb') as f:
         data = bytearray(f.read())
@@ -304,9 +307,9 @@ def patch_mhgugame_dll(dll_path):
         if mnem == 'vpbroadcastb':
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
-            if va == 0x2601dc6de:
+            if (va - IMAGE_BASE) == 0x1dc6de:
                 tcode.extend(bytes.fromhex('c5f96ec0c5f970c000'))
-            elif va == 0x260654a10:
+            elif (va - IMAGE_BASE) == 0x654a10:
                 tcode.extend(bytes.fromhex('c4c1796ec0c5f970c000'))
             ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
