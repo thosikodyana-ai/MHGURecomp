@@ -66,6 +66,7 @@ static void write_ymm(PCONTEXT ctx, int reg, const ymm256_t *in) {
     DWORD len = 0;
     uint8_t *ymm_hi = (uint8_t *)LocateXStateFeature(ctx, XSTATE_AVX, &len);
     if (ymm_hi && len >= (DWORD)((reg + 1) * 16)) {
+        *(uint64_t *)(ymm_hi - 64) |= (1ULL << XSTATE_AVX);
         memcpy(ymm_hi + reg * 16, &in->b[16], 16);
     }
 }

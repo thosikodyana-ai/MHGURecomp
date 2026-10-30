@@ -1,4 +1,4 @@
-name: Build MHGURecomp Non-AVX2 (AMD A10-7800 / bdver3)
+name: Build MHGURecomp Non-AVX2 v3 (AMD A10-7800 / bdver3)
 
 on:
   workflow_dispatch:
@@ -15,11 +15,12 @@ permissions:
 
 jobs:
   build-windows-non-avx2:
-    name: Windows UCRT64 Non-AVX2 (AMD A10-7800)
+    name: Windows UCRT64 Non-AVX2 v3 (AMD A10-7800 Movie06 Fix)
     runs-on: windows-latest
     defaults:
       run:
         shell: msys2 {0}
+
     steps:
       - name: Checkout Patched MHGURecomp Repository
         uses: actions/checkout@v4
@@ -32,10 +33,12 @@ jobs:
           install: >-
             make
             git
+            grep
             diffutils
             curl
             unzip
             zip
+            mingw-w64-ucrt-x86_64-binutils
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-clang
             mingw-w64-ucrt-x86_64-lld
@@ -47,13 +50,13 @@ jobs:
             mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-vulkan-memory-allocator
 
-      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + In-Process MOVBE/AVX2/BMI2 VEH Emulator)
+      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + Movie06 FFmpeg Fix + XSAVE YMM Mask Fix)
         run: |
           TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe' }}"
           echo "Compiling with GENARCH: $TARGET_ARCH"
           make -j4 build/mhgurecomp.exe bundle licenses GEN_SRC="" GENARCH="$TARGET_ARCH"
 
-      - name: Fetch Official Release 0.10.1 & Patch mhgugame.dll for AMD A10-7800
+      - name: Fetch Official Release 0.10.1 & Run v3 AOT .tramp Patcher (19,953 Sites) on mhgugame.dll
         run: |
           curl -fL --retry 3 -o official_release.zip https://github.com/morerokk/MHGURecomp/releases/download/0.10.1/Windows-MHGURecomp.0.10.1.zip
           unzip -q official_release.zip -d official_rel
@@ -64,30 +67,39 @@ jobs:
           cp -rf official_rel/Windows-MHGURecomp/mods build/ 2>/dev/null || true
           python3 tools/patch_mhgugame_dll.py build/mhgugame.dll
 
-      - name: Package Ready-to-Play Non-AVX2 Zip Archive
+      - name: Package Ready-to-Play Non-AVX2 v3 Zip Archives
         run: |
-          mv build Windows-MHGURecomp-NonAVX2-A10-7800
-          zip -r9 Windows-MHGURecomp-NonAVX2-A10-7800.zip Windows-MHGURecomp-NonAVX2-A10-7800
-          ls -lh Windows-MHGURecomp-NonAVX2-A10-7800.zip
+          (cd build && zip -r9 ../MHGURecomp-v3-Movie06-Fix-Patch.zip mhgugame.dll mhgurecomp.exe)
+          mv build Windows-MHGURecomp-NonAVX2-A10-7800-v3
+          zip -r9 Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip Windows-MHGURecomp-NonAVX2-A10-7800-v3
+          ls -lh MHGURecomp-v3-Movie06-Fix-Patch.zip Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip
 
-      - name: Upload Build Artifact
+      - name: Upload Build Artifact v3
         uses: actions/upload-artifact@v4
         with:
-          name: Windows-MHGURecomp-NonAVX2-A10-7800
-          path: Windows-MHGURecomp-NonAVX2-A10-7800.zip
+          name: Windows-MHGURecomp-NonAVX2-A10-7800-v3
+          path: |
+            MHGURecomp-v3-Movie06-Fix-Patch.zip
+            Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip
           retention-days: 30
 
-      - name: Publish GitHub Release (v0.10.1-non-avx2-a10-7800)
+      - name: Publish GitHub Release (v0.10.1-non-avx2-a10-7800-v3)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.10.1-non-avx2-a10-7800
-          name: "MHGURecomp 0.10.1 Non-AVX2 v2 (AMD A10-7800 / bdver3 + MOVBE/AVX2/BMI2 Fix)"
+          tag_name: v0.10.1-non-avx2-a10-7800-v3
+          name: "MHGURecomp 0.10.1 Non-AVX2 v3 (Movie06 Black Screen Fix · 19,953 Static AOT .tramp Patch)"
           body: |
-            ### Native Non-AVX2 v2 Build for AMD A10-7800 (Steamroller / bdver3) & Pre-Haswell CPUs
-            - **Fixed Crash at `f_d8a6fc+4d7` (`exception c000001d`)**: Root-caused to `MOVBE` (`0F 38 F0` / `0F 38 F1`, e.g., `44 0f 38 f1 5e 08` -> `movbe [rsi+8], r11d`), which is part of `-march=x86-64-v3` but unsupported on AMD A10-7800 (`bdver3` / Steamroller).
-            - **`mhgurecomp.exe`**: Compiled natively with `-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe` and includes `runtime/avx2_bmi2_veh.c` supporting `MOVBE` (16/32/64-bit load & store), `BMI2`, and `AVX2` (both `L=0` 128-bit XMM and `L=1` 256-bit YMM).
-            - **`mhgugame.dll` (from 0.10.1)**: Statically patched in-place (`tools/patch_mhgugame_dll.py`) for switch-table `RORX` sites and `MOVBE + BSWAP` pairs (`f_d8a6fc+4d7`).
-          files: Windows-MHGURecomp-NonAVX2-A10-7800.zip
+            ### Native Non-AVX2 v3 Build for AMD A10-7800 (Steamroller / bdver3) — Movie06.mp4 Black Screen Fix
+            - **Fixed `movie06.mp4` Black Screen After Capcom Logo**:
+              - **100% Static AOT Binary Translation (`mhgugame.dll`)**: Appends executable `.tramp` section (`RVA 0x057af000`) and translates all **19,953 non-bdver3 instructions** (`10,068 RORX`, `4,846 SHLX`, `3,338 SHRX`, `971 MOVBE`, `648 SARX`, `57 BZHI`, `23 VPBROADCASTD`, `2 VPBROADCASTB`) ahead-of-time into native AMD A10-7800 instructions, eliminating the 6-thread H.264/AAC VEH exception lock contention (`0` `#UD` exceptions at runtime).
+              - **FFmpeg H.264/AAC CPU Flags (`runtime/hle/movie.c` + `Makefile`)**: Forces FFmpeg to mask out `AV_CPU_FLAG_AVX2`, `AV_CPU_FLAG_BMI2`, and `AV_CPU_FLAG_AVX512` and compiles bundled FFmpeg with `GENARCH` (`-march=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe`).
+              - **XSAVE YMM Upper-Lane Restoration (`runtime/avx2_bmi2_veh.c`)**: Sets `XSTATE_MASK_AVX` in `XSAVE_HEADER.Mask` inside `write_ymm`.
+            - **Download Options**:
+              - **`MHGURecomp-v3-Movie06-Fix-Patch.zip`**: Lightweight patch containing `mhgugame.dll` + `mhgurecomp.exe` (extract & overwrite into your existing v2 folder).
+              - **`Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip`**: Complete standalone ready-to-play v3 bundle.
+          files: |
+            MHGURecomp-v3-Movie06-Fix-Patch.zip
+            Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip
           draft: false
           prerelease: false
         env:

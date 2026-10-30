@@ -11,6 +11,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/cpu.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -472,6 +473,7 @@ static void dec_configure(Cpu *c) {  // slot 2 (MediaData *)
     Decoder *d = self_state(c);
     AVCodecParameters *p = md(ARG(1))->codecpar;
     if (!p) { LOG("[movie] Configure without codec parameters\n"); RET(MOVIE_ERR); return; }
+    av_force_cpu_flags(av_get_cpu_flags() & ~(AV_CPU_FLAG_AVX2 | AV_CPU_FLAG_BMI2 | AV_CPU_FLAG_AVX512 | AV_CPU_FLAG_AVX512ICL));
     const AVCodec *codec = avcodec_find_decoder(p->codec_id);
     if (!codec) { LOG("[movie] no decoder for codec %d\n", p->codec_id); RET(MOVIE_ERR); return; }
     d->ctx = avcodec_alloc_context3(codec);

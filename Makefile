@@ -46,7 +46,7 @@ FFMPEG_LIBS   := $(addprefix $(FFMPEG_DIR)/lib/,libavformat.a libavcodec.a libav
 FFMPEG_CONF   := --disable-everything --disable-programs --disable-doc --disable-network --disable-autodetect \
                  --disable-debug --disable-avdevice --disable-avfilter --disable-swscale --disable-swresample \
                  --enable-static --disable-shared --enable-protocol=file --enable-demuxer=mov \
-                 --enable-parser=h264,aac --enable-decoder=h264,aac --disable-avx2 --disable-avx512
+                 --enable-parser=h264,aac --enable-decoder=h264,aac --disable-avx2 --disable-avx512 --extra-cflags="$(GENARCH)"
 # (nasm: FFmpeg's assembly for x86; without it the plain C versions, fast enough for 960x540 movies)
 FFMPEG_CONF   += $(if $(shell command -v nasm 2>/dev/null),,--disable-x86asm)
 ifeq ($(FFMPEG),system)
