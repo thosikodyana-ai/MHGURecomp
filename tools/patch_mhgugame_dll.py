@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Full AOT Static Binary Translator (v3) for MHGURecomp on AMD A10-7800 (bdver3).
-Appends an executable .tramp section (RVA 0x057af000) to mhgugame.dll and statically translates
-all 19,953 non-bdver3 instructions (10,068 rorx, 8,832 shlx/shrx/sarx, 971 movbe, 57 bzhi,
-23 vpbroadcastd, 2 vpbroadcastb) so the game executes with ZERO runtime #UD exceptions.
+Full AOT Static Binary Translator (v3.1) for MHGURecomp on AMD A10-7800 (bdver3).
+Fixes register-clobbering in SHLX/SHRX/SARX (when cnt_reg == dst_reg), BZHI (when memory base is %rcx
+or W == 0 jae offset), VPBROADCASTB memory load, and MOVBE store register preservation,
+and avoids multi-instruction relocation across 4-byte MOVBE boundaries.
 """
 import re
 import shutil
@@ -11,7 +11,7 @@ import struct
 import subprocess
 import sys
 
-IMAGE_BASE = 0x260000000
+IMAGE_BASE = 0x180000000
 
 
 def align_up(val, align):
@@ -45,7 +45,7 @@ def va_to_file_offset(va, sections):
     for s in sections:
         if s['vaddr'] <= rva < s['vaddr'] + max(s['vsize'], s['rsize']):
             return s['rptr'] + (rva - s['vaddr'])
-    raise ValueError(f"VA {hex(va)} not found in any section")
+    raise ValueError(f"VA {hex(va)} (RVA {hex(rva)}) not found in any section")
 
 
 def append_tramp_section(data, tramp_size=0x100000):
@@ -107,7 +107,7 @@ def encode_modrm_op(opc, reg_op, rm_reg, is_64=False, prefix_66=False):
 
 
 def encode_mov_reg_reg(dst, src, is_64=False):
-    if dst == src and not is_64:
+    if dst == src and is_64:
         return b''
     return encode_modrm_op(0x89, src, dst, is_64=is_64)
 
@@ -206,7 +206,6 @@ def emit_mem_op_from_vex_tail(opc, R, X, B, W, tail, rsp_delta=0, prefix_66=Fals
 
 LINE_RE = re.compile(r'^\s*([0-9a-fA-F]+):\s+((?:[0-9a-fA-F]{2}\s)+)\s*(.+)$')
 TARGET_RE = re.compile(r'\b(rorx|shlx|sarx|shrx|movbe|mulx|bzhi|pext|pdep|vpbroadcastd|vpbroadcastb)\b')
-BRANCH_RE = re.compile(r'\b(?:j[a-z]+|callq?)\s+(?:0x)?([0-9a-fA-F]+)\s*<')
 
 
 def parse_objdump_line(line):
@@ -221,37 +220,22 @@ def parse_objdump_line(line):
 
 def patch_mhgugame_dll(dll_path):
     objdump_bin = shutil.which('objdump') or shutil.which('x86_64-w64-mingw32-objdump') or 'objdump'
-    print(f"[v3] Disassembling {dll_path} using {objdump_bin} + grep...")
-    cmd = f'"{objdump_bin}" -d --insn-width=16 "{dll_path}" | grep -B 40 -A 5 -E "rorx|shlx|sarx|shrx|movbe|mulx|bzhi|pext|pdep|vpbroadcastd|vpbroadcastb"'
+    print(f"[v3.1] Disassembling {dll_path} using {objdump_bin} + grep...")
+    cmd = f'"{objdump_bin}" -d --insn-width=16 "{dll_path}" | grep -E "rorx|shlx|sarx|shrx|movbe|mulx|bzhi|pext|pdep|vpbroadcastd|vpbroadcastb"'
     proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, text=True, bufsize=1024 * 1024)
 
-    parsed_window = []
-    branch_targets = set()
-
+    records = []
     for line in proc.stdout:
         p = parse_objdump_line(line)
-        if p is None:
-            continue
-        va, raw, disasm = p
-        if '<' in disasm:
-            bm = BRANCH_RE.search(disasm)
-            if bm:
-                branch_targets.add(int(bm.group(1), 16))
-        parsed_window.append(p)
+        if p is not None and TARGET_RE.search(p[2]):
+            records.append(p)
 
     proc.wait()
 
-    records = []
-    for i, item in enumerate(parsed_window):
-        if TARGET_RE.search(item[2]):
-            prev_i = parsed_window[i - 1] if i > 0 else None
-            next_i = parsed_window[i + 1] if i + 1 < len(parsed_window) else None
-            records.append((prev_i, item, next_i))
-
     global IMAGE_BASE
     if records:
-        IMAGE_BASE = records[0][1][0] & ~0x0FFFFFFF
-    print(f"[v3] Found {len(records)} non-bdver3 sites, {len(branch_targets)} nearby branch targets, IMAGE_BASE={hex(IMAGE_BASE)}.")
+        IMAGE_BASE = records[0][0] & ~0x0FFFFFFF
+    print(f"[v3.1] Found {len(records)} non-bdver3 sites, IMAGE_BASE={hex(IMAGE_BASE)}.")
 
     with open(dll_path, 'rb') as f:
         data = bytearray(f.read())
@@ -279,28 +263,24 @@ def patch_mhgugame_dll(dll_path):
             res.extend(b'\x90' * (pad_len - 5))
         return bytes(res)
 
-    patched_vas = set()
     stats = {
         'vpbroadcastd_inplace': 0,
         'vpbroadcastb_tramp': 0,
         'movbe_load_inplace': 0,
         'movbe_tramp': 0,
+        'movbe_4byte_veh': 0,
         'rorx_tramp': 0,
         'shiftx_tramp': 0,
         'bzhi_tramp': 0,
     }
 
-    for prev_insn, cur_insn, next_insn in records:
-        va, raw, disasm = cur_insn
-        if va in patched_vas:
-            continue
+    for va, raw, disasm in records:
         mnem = disasm.split()[0]
 
         if mnem == 'vpbroadcastd':
             new_raw = bytearray(raw)
             new_raw[3] = 0x18
             patch_at_va(va, new_raw)
-            patched_vas.add(va)
             stats['vpbroadcastd_inplace'] += 1
             continue
 
@@ -308,15 +288,16 @@ def patch_mhgugame_dll(dll_path):
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
             if (va - IMAGE_BASE) == 0x1dc6de:
-                tcode.extend(bytes.fromhex('c5f96ec0c5f970c000'))
+                # vpbroadcastb (%rcx,%rax,1), %xmm0
+                tcode.extend(bytes.fromhex('9c500fb6040169c001010101c5f96ec0c5f970c000589d'))
             elif (va - IMAGE_BASE) == 0x654a10:
-                tcode.extend(bytes.fromhex('c4c1796ec0c5f970c000'))
+                # vpbroadcastb (%r10,%rax,1), %xmm0
+                tcode.extend(bytes.fromhex('9c50410fb6040269c001010101c5f96ec0c5f970c000589d'))
             ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
             tcode.extend(b'\xE9' + struct.pack('<i', rel_back))
             write_tramp(tcode)
             patch_at_va(va, make_jmp_rel32(va, tramp_va, len(raw)))
-            patched_vas.add(va)
             stats['vpbroadcastb_tramp'] += 1
             continue
 
@@ -330,7 +311,7 @@ def patch_mhgugame_dll(dll_path):
 
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
-            tcode.append(0x9C)
+            tcode.append(0x9C)  # pushfq
 
             if mod == 3:
                 src_reg = (modrm & 7) | (8 if B else 0)
@@ -339,13 +320,12 @@ def patch_mhgugame_dll(dll_path):
                 tcode.extend(emit_mem_op_from_vex_tail(0x8B, R, X, B, W, mem_or_reg_tail, rsp_delta=8))
 
             tcode.extend(encode_modrm_op(0xC1, 1, dst_reg, is_64=bool(W)) + bytes([imm8]))
-            tcode.append(0x9D)
+            tcode.append(0x9D)  # popfq
             ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
             tcode.extend(b'\xE9' + struct.pack('<i', rel_back))
             write_tramp(tcode)
             patch_at_va(va, make_jmp_rel32(va, tramp_va, len(raw)))
-            patched_vas.add(va)
             stats['rorx_tramp'] += 1
             continue
 
@@ -359,50 +339,40 @@ def patch_mhgugame_dll(dll_path):
 
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
-            tcode.append(0x9C)
+            tcode.append(0x9C)  # pushfq (rsp_delta = 8)
 
             if dst_reg == 1:
-                scratch = 0 if cnt_reg != 0 else 2
-                tcode.extend(encode_push(scratch))
+                # Use %rax (0) as work_dst so neither %rax nor %rcx is clobbered before reading src!
+                tcode.extend(encode_push(0))        # push %rax (rsp_delta = 16)
+                tcode.extend(encode_push(cnt_reg))  # push cnt_reg (rsp_delta = 24)
                 if mod == 3:
                     src_reg = (modrm & 7) | (8 if B else 0)
-                    tcode.extend(encode_mov_reg_reg(scratch, src_reg, is_64=bool(W)))
+                    tcode.extend(encode_mov_reg_reg(0, src_reg, is_64=bool(W)))
                 else:
-                    s_R = 1 if scratch >= 8 else 0
-                    s_modrm = (modrm & 0xC7) | ((scratch & 7) << 3)
-                    tcode.extend(emit_mem_op_from_vex_tail(0x8B, s_R, X, B, W, bytes([s_modrm]) + tail[1:], rsp_delta=16))
-                if cnt_reg != 1:
-                    tcode.extend(encode_mov_reg_reg(1, cnt_reg, is_64=False))
-                tcode.extend(encode_modrm_op(0xD3, shift_subop, scratch, is_64=bool(W)))
-                tcode.extend(encode_mov_reg_reg(1, scratch, is_64=bool(W)))
-                tcode.extend(encode_pop(scratch))
+                    s_modrm = (modrm & 0xC7) | (0 << 3)
+                    tcode.extend(emit_mem_op_from_vex_tail(0x8B, 0, X, B, W, bytes([s_modrm]) + tail[1:], rsp_delta=24))
+                tcode.extend(encode_pop(1))         # pop %rcx (cnt_reg)
+                tcode.extend(encode_modrm_op(0xD3, shift_subop, 0, is_64=bool(W)))
+                tcode.extend(encode_mov_reg_reg(1, 0, is_64=bool(W)))
+                tcode.extend(encode_pop(0))         # pop %rax
             else:
-                tcode.extend(encode_push(1))
-                if cnt_reg == dst_reg:
-                    tcode.extend(encode_mov_reg_reg(1, cnt_reg, is_64=False))
-                    if mod == 3:
-                        src_reg = (modrm & 7) | (8 if B else 0)
-                        tcode.extend(encode_mov_reg_reg(dst_reg, src_reg, is_64=bool(W)))
-                    else:
-                        tcode.extend(emit_mem_op_from_vex_tail(0x8B, R, X, B, W, tail, rsp_delta=16))
+                tcode.extend(encode_push(1))        # push %rcx (rsp_delta = 16)
+                tcode.extend(encode_push(cnt_reg))  # push cnt_reg (rsp_delta = 24)
+                if mod == 3:
+                    src_reg = (modrm & 7) | (8 if B else 0)
+                    tcode.extend(encode_mov_reg_reg(dst_reg, src_reg, is_64=bool(W)))
                 else:
-                    if mod == 3:
-                        src_reg = (modrm & 7) | (8 if B else 0)
-                        tcode.extend(encode_mov_reg_reg(dst_reg, src_reg, is_64=bool(W)))
-                    else:
-                        tcode.extend(emit_mem_op_from_vex_tail(0x8B, R, X, B, W, tail, rsp_delta=16))
-                    if cnt_reg != 1:
-                        tcode.extend(encode_mov_reg_reg(1, cnt_reg, is_64=False))
+                    tcode.extend(emit_mem_op_from_vex_tail(0x8B, R, X, B, W, tail, rsp_delta=24))
+                tcode.extend(encode_pop(1))         # pop %rcx (cnt_reg)
                 tcode.extend(encode_modrm_op(0xD3, shift_subop, dst_reg, is_64=bool(W)))
-                tcode.extend(encode_pop(1))
+                tcode.extend(encode_pop(1))         # pop %rcx
 
-            tcode.append(0x9D)
+            tcode.append(0x9D)  # popfq
             ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
             tcode.extend(b'\xE9' + struct.pack('<i', rel_back))
             write_tramp(tcode)
             patch_at_va(va, make_jmp_rel32(va, tramp_va, len(raw)))
-            patched_vas.add(va)
             stats['shiftx_tramp'] += 1
             continue
 
@@ -413,157 +383,153 @@ def patch_mhgugame_dll(dll_path):
             idx_reg = vvvv
             mod = (modrm >> 6) & 3
 
-            scratch = 0
-            while scratch in (dst_reg, idx_reg, 4):
-                scratch += 1
+            work_dst = 0 if dst_reg == 1 else dst_reg
+            s_mask = 2 if work_dst != 2 else 0
 
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
-            tcode.append(0x9C)
-            tcode.extend(encode_push(scratch))
-            tcode.extend(encode_push(1))
-
-            tcode.extend(encode_mov_reg_reg(1, idx_reg, is_64=False))
-            tcode.extend(bytes([0x80, 0xE1, 0xFF]))
+            tcode.append(0x9C)                  # pushfq (rsp_delta = 8)
+            tcode.extend(encode_push(s_mask))   # push s_mask (rsp_delta = 16)
+            if dst_reg == 1:
+                tcode.extend(encode_push(work_dst))  # push %rax (rsp_delta = 24)
+            else:
+                tcode.extend(encode_push(1))         # push %rcx (rsp_delta = 24)
+            tcode.extend(encode_push(idx_reg))  # push idx_reg (rsp_delta = 32)
 
             if mod == 3:
                 src_reg = (modrm & 7) | (8 if B else 0)
-                if src_reg == 1:
-                    tcode.extend(bytes([0x48, 0x8B, 0x0C, 0x24]))
-                    tcode.extend(encode_mov_reg_reg(dst_reg, 1, is_64=bool(W)))
-                    tcode.extend(encode_mov_reg_reg(1, idx_reg, is_64=False))
-                else:
-                    tcode.extend(encode_mov_reg_reg(dst_reg, src_reg, is_64=bool(W)))
+                tcode.extend(encode_mov_reg_reg(work_dst, src_reg, is_64=bool(W)))
             else:
-                tcode.extend(emit_mem_op_from_vex_tail(0x8B, R, X, B, W, tail, rsp_delta=24))
+                w_R = 1 if work_dst >= 8 else 0
+                w_modrm = (modrm & 0xC7) | ((work_dst & 7) << 3)
+                tcode.extend(emit_mem_op_from_vex_tail(0x8B, w_R, X, B, W, bytes([w_modrm]) + tail[1:], rsp_delta=32))
 
-            tcode.extend(bytes([0x80, 0xF9, 64 if W else 32]))
-            tcode.extend(bytes([0x73, 14 if W else 12]))
-            tcode.extend(bytes([0x48, 0xC7, 0xC0 + scratch, 0xFF, 0xFF, 0xFF, 0xFF]))
-            tcode.extend(encode_modrm_op(0xD3, 4, scratch, is_64=bool(W)))
-            tcode.extend(encode_modrm_op(0xF7, 2, scratch, is_64=bool(W)))
-            tcode.extend(encode_modrm_op(0x21, scratch, dst_reg, is_64=bool(W)))
+            tcode.extend(encode_pop(1))         # pop %rcx (idx_reg)
+            tcode.extend(bytes([0x80, 0xF9, 64 if W else 32]))  # cmp $64/$32, %cl
 
-            tcode.extend(encode_pop(1))
-            tcode.extend(encode_pop(scratch))
-            tcode.append(0x9D)
+            bbody = bytearray()
+            bbody.extend(encode_modrm_op(0xC7, 0, s_mask, is_64=True) + b'\xFF\xFF\xFF\xFF')
+            bbody.extend(encode_modrm_op(0xD3, 4, s_mask, is_64=bool(W)))
+            bbody.extend(encode_modrm_op(0xF7, 2, s_mask, is_64=bool(W)))
+            bbody.extend(encode_modrm_op(0x21, s_mask, work_dst, is_64=bool(W)))
+
+            tcode.extend(bytes([0x73, len(bbody)]))  # jae +len(bbody)
+            tcode.extend(bbody)
+
+            if dst_reg == 1:
+                tcode.extend(encode_mov_reg_reg(1, work_dst, is_64=bool(W)))
+                tcode.extend(encode_pop(work_dst))
+            else:
+                tcode.extend(encode_pop(1))
+            tcode.extend(encode_pop(s_mask))
+            tcode.append(0x9D)  # popfq
+
             ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
             tcode.extend(b'\xE9' + struct.pack('<i', rel_back))
             write_tramp(tcode)
             patch_at_va(va, make_jmp_rel32(va, tramp_va, len(raw)))
-            patched_vas.add(va)
             stats['bzhi_tramp'] += 1
             continue
 
         if mnem == 'movbe':
+            if len(raw) < 5:
+                # Leave 4-byte MOVBE instructions untouched so we never overwrite adjacent instructions;
+                # runtime/avx2_bmi2_veh.c emulates 4-byte MOVBE seamlessly.
+                stats['movbe_4byte_veh'] += 1
+                continue
+
             if len(raw) == 5 and raw[0] == 0x0F and raw[1] == 0x38 and raw[2] == 0xF0:
                 modrm = raw[3]
                 dst_reg = (modrm >> 3) & 7
                 mem_tail = raw[3:]
                 new_bytes = bytes([0x8B]) + mem_tail + bytes([0x0F, 0xC8 + dst_reg])
                 patch_at_va(va, new_bytes)
-                patched_vas.add(va)
                 stats['movbe_load_inplace'] += 1
                 continue
-
-            insns_to_emulate = [(va, raw, disasm)]
-            total_len = len(raw)
-            patch_start_va = va
-
-            if total_len == 4:
-                next_va, next_raw, next_disasm = next_insn
-                prev_va, prev_raw, prev_disasm = prev_insn
-                if next_va not in branch_targets:
-                    insns_to_emulate.append((next_va, next_raw, next_disasm))
-                    total_len += len(next_raw)
-                    patched_vas.add(next_va)
-                elif prev_disasm.startswith('movbe') and (prev_va + len(prev_raw) == va):
-                    patch_start_va = prev_va
-                    insns_to_emulate = [(prev_va, prev_raw, prev_disasm), (va, raw, disasm)]
-                    total_len = len(prev_raw) + len(raw)
-                    patched_vas.add(prev_va)
-                else:
-                    modrm = raw[3]
-                    src_reg = (modrm >> 3) & 7
-                    rm_reg = modrm & 7
-                    inplace_bytes = bytes([0x0F, 0xC8 + src_reg, 0x89, 0x00 | (src_reg << 3) | rm_reg])
-                    patch_at_va(va, inplace_bytes)
-                    patched_vas.add(va)
-                    stats['movbe_load_inplace'] += 1
-                    continue
 
             tramp_va = IMAGE_BASE + tramp_cur_rva
             tcode = bytearray()
 
-            for _, iraw, idisasm in insns_to_emulate:
-                if not idisasm.startswith('movbe'):
-                    tcode.extend(iraw)
-                    continue
+            pos = 0
+            has_66 = False
+            rex = 0x40
+            if raw[pos] == 0x66:
+                has_66 = True
+                pos += 1
+            if 0x40 <= raw[pos] <= 0x4F:
+                rex = raw[pos]
+                pos += 1
+            opc_dir = raw[pos + 2]
+            tail = raw[pos + 3:]
+            modrm = tail[0]
+            W = 1 if (rex & 0x08) else 0
+            R = 1 if (rex & 0x04) else 0
+            reg = ((modrm >> 3) & 7) | (8 if R else 0)
 
-                pos = 0
-                has_66 = False
-                rex = 0x40
-                if iraw[pos] == 0x66:
-                    has_66 = True
-                    pos += 1
-                if 0x40 <= iraw[pos] <= 0x4F:
-                    rex = iraw[pos]
-                    pos += 1
-                opc_dir = iraw[pos + 2]
-                tail = iraw[pos + 3:]
-                modrm = tail[0]
-                W = 1 if (rex & 0x08) else 0
-                R = 1 if (rex & 0x04) else 0
-                reg = ((modrm >> 3) & 7) | (8 if R else 0)
-
-                if opc_dir == 0xF0:
-                    _, adj_tail = adjust_rsp_disp_in_mem_tail(rex, tail, 0)
-                    if has_66:
-                        tcode.append(0x66)
-                    if rex != 0x40:
-                        tcode.append(rex)
+            if opc_dir == 0xF0:  # load
+                if has_66:
+                    tcode.append(0x9C)  # pushfq (rsp_delta = 8)
+                    l_rex, adj_tail = adjust_rsp_disp_in_mem_tail(rex, tail, 8)
+                    tcode.append(0x66)
+                    if l_rex != 0x40:
+                        tcode.append(l_rex)
                     tcode.append(0x8B)
                     tcode.extend(adj_tail)
-                    if has_66:
-                        tcode.append(0x9C)
-                        tcode.extend(encode_bswap(reg, is_64=False, is_16=True))
-                        tcode.append(0x9D)
-                    else:
-                        tcode.extend(encode_bswap(reg, is_64=bool(W), is_16=False))
+                    tcode.extend(encode_bswap(reg, is_64=False, is_16=True))
+                    tcode.append(0x9D)  # popfq
                 else:
-                    if has_66:
-                        tcode.append(0x9C)
-                        tcode.extend(encode_bswap(reg, is_64=False, is_16=True))
-                        tcode.append(0x66)
-                        if rex != 0x40:
-                            tcode.append(rex)
-                        tcode.append(0x89)
-                        tcode.extend(tail)
-                        tcode.extend(encode_bswap(reg, is_64=False, is_16=True))
-                        tcode.append(0x9D)
-                    else:
-                        tcode.extend(encode_bswap(reg, is_64=bool(W), is_16=False))
-                        if rex != 0x40:
-                            tcode.append(rex)
-                        tcode.append(0x89)
-                        tcode.extend(tail)
-                        tcode.extend(encode_bswap(reg, is_64=bool(W), is_16=False))
+                    l_rex, adj_tail = adjust_rsp_disp_in_mem_tail(rex, tail, 0)
+                    if l_rex != 0x40:
+                        tcode.append(l_rex)
+                    tcode.append(0x8B)
+                    tcode.extend(adj_tail)
+                    tcode.extend(encode_bswap(reg, is_64=bool(W), is_16=False))
+            else:  # store (0xF1)
+                B_bit = 1 if (rex & 0x01) else 0
+                X_bit = 1 if (rex & 0x02) else 0
+                if (modrm & 7) == 4:
+                    sib = tail[1]
+                    base_reg = (sib & 7) | (8 if B_bit else 0)
+                    idx_reg = ((sib >> 3) & 7) | (8 if X_bit else 0)
+                else:
+                    base_reg = (modrm & 7) | (8 if B_bit else 0)
+                    idx_reg = -1
+                s_reg = 0
+                while s_reg in (base_reg, idx_reg, 4):
+                    s_reg += 1
 
-            ret_va = patch_start_va + total_len
+                tcode.append(0x9C)  # pushfq (rsp_delta = 8)
+                tcode.extend(encode_push(s_reg))  # push s_reg (rsp_delta = 16)
+                tcode.extend(encode_mov_reg_reg(s_reg, reg, is_64=bool(W)))
+                tcode.extend(encode_bswap(s_reg, is_64=bool(W), is_16=has_66))
+
+                s_rex = (rex & ~0x04) | (0x04 if s_reg >= 8 else 0)
+                s_modrm = (modrm & 0xC7) | ((s_reg & 7) << 3)
+                s_tail = bytes([s_modrm]) + tail[1:]
+                s_rex, adj_s_tail = adjust_rsp_disp_in_mem_tail(s_rex, s_tail, 16)
+                if has_66:
+                    tcode.append(0x66)
+                if s_rex != 0x40:
+                    tcode.append(s_rex)
+                tcode.append(0x89)
+                tcode.extend(adj_s_tail)
+                tcode.extend(encode_pop(s_reg))
+                tcode.append(0x9D)  # popfq
+
+            ret_va = va + len(raw)
             rel_back = ret_va - (tramp_va + len(tcode) + 5)
             tcode.extend(b'\xE9' + struct.pack('<i', rel_back))
             write_tramp(tcode)
-            patch_at_va(patch_start_va, make_jmp_rel32(patch_start_va, tramp_va, total_len))
-            patched_vas.add(va)
+            patch_at_va(va, make_jmp_rel32(va, tramp_va, len(raw)))
             stats['movbe_tramp'] += 1
             continue
 
-    print(f"[v3] Patch stats: {stats}")
-    print(f"[v3] Trampoline bytes used: {tramp_cur_rva - tramp_vaddr} / {0x100000}")
+    print(f"[v3.1] Patch stats: {stats}")
+    print(f"[v3.1] Trampoline bytes used: {tramp_cur_rva - tramp_vaddr} / {0x100000}")
     with open(dll_path, 'wb') as f:
         f.write(data)
-    print(f"[v3] Successfully patched {dll_path} ({len(data)} bytes)")
+    print(f"[v3.1] Successfully patched {dll_path} ({len(data)} bytes)")
 
 
 if __name__ == '__main__':
