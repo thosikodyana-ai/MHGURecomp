@@ -16,7 +16,7 @@
 #include "config.h"
 #include "rt.h"
 
-Config g_config = {DISPLAY_BORDERLESS, 1920, 1080, 0, 0, 60, 1, 1, 1, FACE_POSITION, 39500, "", 1, 1, 1, {{1, 1, 1, 1}, 2}, 1.0f, 0.0f, 1.0f, UI_CENTER, 1};
+Config g_config = {DISPLAY_BORDERLESS, 1920, 1080, 0, 0, 60, 1, 1, 1, FACE_POSITION, 39500, "", 1, 1, 1, {{1, 1, 1, 1}, 2}, 1.0f, 0.0f, 1.0f, UI_CENTER, 1, 2, -1, 5, 15, 0, 1};
 uint32_t g_render_size[2] = {1920, 1080};
 float g_render_aspect = 16.0f / 9.0f;
 float g_fov_scale = 1.0f;
@@ -131,7 +131,26 @@ static const char DEFAULT_INI[] =
     "; next to mhgurecomp.exe) into a save that has never had any downloads, such as a new one. Only the download data\n"
     "; is written, once; saves that already have downloads are left alone. Without a donor save nothing happens.\n"
     "; Off: saves are never changed.\n"
-    "BonusContent = On\n";
+    "BonusContent = On\n"
+    "\n"
+    "[Diagnostics]\n"
+    "; Logging verbosity: TRACE, DEBUG, INFO, WARN, ERROR, or FATAL (env override: MHGU_LOG_LEVEL).\n"
+    "LogLevel = INFO\n"
+    "\n"
+    "; Mirror log output to console / stderr: Auto, On, or Off (env override: MHGU_LOG_CONSOLE=1|0).\n"
+    "LogConsole = Auto\n"
+    "\n"
+    "; Number of rotated log files to keep (log.txt, log.1.txt ...): 1..50 (env override: MHGU_LOG_KEEP).\n"
+    "LogKeepFiles = 5\n"
+    "\n"
+    "; Watchdog hang detection timeout in seconds (0 = Off, default = 15; env override: MHGU_WATCHDOG_SEC).\n"
+    "WatchdogTimeout = 15\n"
+    "\n"
+    "; Khronos Vulkan validation layer: On or Off (default = Off; env override: MHGU_VK_VALIDATION=1|0).\n"
+    "VulkanValidation = Off\n"
+    "\n"
+    "; Write Windows minidump (.dmp) to crash/ folder on unhandled exception: On or Off.\n"
+    "CrashMinidump = On\n";
 
 static void ini_path(char *buf, size_t size) {
     const char *e = getenv("MHGU_CONFIG");
@@ -307,6 +326,34 @@ static void set_key(const char *key, char *val, int line) {
         int f = atoi(v);
         if (f >= 30 && f <= 240) g_config.fps = f;
         else ok = false;
+    } else if (!strcmp(k, "loglevel")) {
+        int l = diag_parse_level(v);
+        if (l >= 0) g_config.log_level = l;
+        else ok = false;
+    } else if (!strcmp(k, "logconsole")) {
+        if (!strcmp(v, "auto")) g_config.log_console = -1;
+        else if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "yes")) g_config.log_console = 1;
+        else if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no")) g_config.log_console = 0;
+        else ok = false;
+    } else if (!strcmp(k, "logkeepfiles") || !strcmp(k, "keepfiles")) {
+        int n = atoi(v);
+        if (n >= 1 && n <= 50) g_config.log_keep_files = n;
+        else ok = false;
+    } else if (!strcmp(k, "watchdogtimeout") || !strcmp(k, "watchdog")) {
+        if (!strcmp(v, "off") || !strcmp(v, "false") || !strcmp(v, "no")) g_config.watchdog_timeout = 0;
+        else {
+            int w = atoi(v);
+            if (w >= 0 && w <= 600) g_config.watchdog_timeout = w;
+            else ok = false;
+        }
+    } else if (!strcmp(k, "vulkanvalidation") || !strcmp(k, "vkvalidation")) {
+        if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "yes")) g_config.vk_validation = 1;
+        else if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no")) g_config.vk_validation = 0;
+        else ok = false;
+    } else if (!strcmp(k, "crashminidump") || !strcmp(k, "minidump")) {
+        if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "yes")) g_config.crash_minidump = 1;
+        else if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no")) g_config.crash_minidump = 0;
+        else ok = false;
     } else {
         LOG("[config] line %d: unknown setting \"%s\" (ignored)\n", line, key);
         return;
@@ -351,8 +398,12 @@ static void append_missing_sections(const char *path, const char *seen) {
 }
 
 void config_load(void) {
+    static bool file_parsed = false;
     char path[1100];
     ini_path(path, sizeof path);
+    if (!file_parsed) {
+        file_parsed = true;
+        diag_phase_begin("parse_ini");
     FILE *f = fopen(path, "r");
     if (!f) {
         FILE *o = fopen(path, "w");
@@ -382,6 +433,12 @@ void config_load(void) {
         fclose(f);
         append_missing_sections(path, seen);
     }
+        diag_configure(g_config.log_level, g_config.log_console, g_config.log_keep_files,
+                       g_config.watchdog_timeout, g_config.vk_validation, g_config.crash_minidump);
+        diag_log_effective_ini(path);
+        diag_phase_end("parse_ini");
+    }
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) return;
 
     const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
     desktop_w = dm ? dm->w : 1920, desktop_h = dm ? dm->h : 1080;

@@ -185,7 +185,11 @@ static void *thread_main(void *arg) {
     KThread *t = arg;
     t_cur = t;
     crash_handler_install();
+    char tname[48];
+    snprintf(tname, sizeof tname, t->handle == 0x101 ? "guest:main" : "guest:t%x", t->handle);
+    diag_thread_register(tname, t->handle, t->entry);
     if (!setjmp(t->unwind)) guest_call(&t->cpu, t->entry);
+    diag_thread_unregister();
     pthread_mutex_lock(&g_klock);
     t->finished = true;
     kernel_signal(&t->obj);

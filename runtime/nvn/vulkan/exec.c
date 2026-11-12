@@ -69,8 +69,14 @@ void vk_wait_seq(uint64_t seq) {
                               .pValues = &seq};
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += plat_now_ns() - t0_;
-    if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r != VK_SUCCESS) FATAL("vkWaitSemaphores: %d (device lost)\n", r);
+    if (r == VK_TIMEOUT) {
+        diag_log_vk_device_lost("vkWaitSemaphores(timeout)", r, vk_frame_counter(), submit_seq, vk_completed_seq());
+        LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
+    } else if (r != VK_SUCCESS) {
+        diag_log_vk_device_lost("vkWaitSemaphores", r, vk_frame_counter(), submit_seq, vk_completed_seq());
+        FATAL("vkWaitSemaphores: %s (%d) (device lost at frame %llu)\n",
+              diag_vk_result_str(r), r, (unsigned long long)vk_frame_counter());
+    }
 }
 
 uint64_t vk_pending_seq(void) { return submit_seq + 1; }
@@ -409,6 +415,7 @@ static JobQueue translate_q = {NULL, NULL, PTHREAD_MUTEX_INITIALIZER, PTHREAD_CO
 
 static void *worker(void *a) {
     JobQueue *q = a;
+    diag_thread_register(q == &translate_q ? "vk:translate" : "vk:compile", 0, 0);
     for (;;) {
         pthread_mutex_lock(&q->lock);
         while (!q->head) pthread_cond_wait(&q->cond, &q->lock);

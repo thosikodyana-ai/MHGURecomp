@@ -38,9 +38,19 @@ static void boot(const char *root) {
     snprintf(exefs, sizeof exefs, "%s/exefs", root);
     snprintf(npdm_path, sizeof npdm_path, "%s/main.npdm", exefs);
 
+    diag_phase_begin("load_gamelib");
     char why[512];
-    if (!gamelib_load(why, sizeof why)) FATAL("%s\n", why);
+    if (!gamelib_load(why, sizeof why)) {
+        diag_phase_fail("load_gamelib", -1, "%s", why);
+        FATAL("%s\n", why);
+    }
+    diag_phase_end("load_gamelib");
+
+    diag_phase_begin("load_exefs");
     loader_load(exefs);
+    diag_phase_end("load_exefs");
+
+    diag_phase_begin("init_kernel");
     kernel_init();
     dispatch_init();
     forge_init();  // (Forge plugins in the mods: runtime/forge.c)
@@ -50,6 +60,7 @@ static void boot(const char *root) {
     quickhunt_init();  // (debug, MHGU_QUICKHUNT: runtime/hle/quickhunt.c)
     emtrace_init();  // (debug, MHGU_EMTRACE: runtime/hle/emtrace.c)
     cheats_init();  // (cheat codes from cheats/: runtime/cheats.c)
+    diag_phase_end("init_kernel");
 
     uint32_t stack_size = 0x100000;
     int prio = 44;
@@ -68,13 +79,24 @@ static void boot(const char *root) {
     if (!start) FATAL("nn::init::Start not found\n");
     uint32_t init_fn = hle_register("<rtld_init_sdk>", rtld_init_sdk);
     uint32_t main_init_fn = hle_register("<rtld_init_main>", rtld_init_main);
+    diag_phase_begin("start_gameloop");
     KThread *t = kernel_create_main_thread(start, stack_size, prio);
     kernel_run_main(t, t->handle, 0, init_fn, main_init_fn);
+    diag_watchdog_start();
+    diag_phase_end("start_gameloop");
 }
 
 int main(int argc, char **argv) {
+    diag_init_early();
     plat_init();
     setvbuf(stderr, NULL, _IONBF, 0);
+    crash_handler_install();
+
+    diag_phase_begin("check_cpu");
+    diag_log_system_info();
+    diag_log_binary_hashes();
+    diag_phase_end("check_cpu");
+
     bool given = false;
     for (int i = 1; i < argc; i++)
         if (argv[i][0] != '-') g_game_dir = argv[i], given = true;
@@ -96,15 +118,23 @@ int main(int argc, char **argv) {
             strcat(save, "/save");
             g_save_dir = save;
         } else {
-            fprintf(stderr, "[main] no user data folder: saves go to save\\ beside the executable\n");
+            LOG("[main] no user data folder: saves go to save\\ beside the executable\n");
         }
+    }
+
+    config_load();
+    diag_log_paths_and_files(g_game_dir, g_save_dir);
+    diag_check_selftest_early();
+
+    if (!given) {
+        diag_phase_begin("check_game_files");
         char main_path[1200];
-        snprintf(main_path, sizeof main_path, "%s/exefs/main", data);
+        snprintf(main_path, sizeof main_path, "%s/exefs/main", g_game_dir);
         FILE *f = fopen(main_path, "rb");
         if (!f) {
             const char *msg = "The game files were not found. Put your own dump's exefs and romfs folders in the data "
                               "folder next to mhgurecomp.exe (data\\exefs, data\\romfs).";
-            fprintf(stderr, "%s\n", msg);
+            diag_phase_fail("check_game_files", 2, "%s (missing %s)", msg, main_path);
             plat_error_box(msg);
             return 1;
         }
@@ -117,13 +147,13 @@ int main(int argc, char **argv) {
             const char *msg = "The game files in the data folder are not version 1.4.0 of Monster Hunter Generations "
                               "Ultimate (data\\exefs\\main, build id FB08F1D20FD1204F). Dump the game with its 1.4.0 "
                               "update applied (exefs from the update, romfs merged).";
-            fprintf(stderr, "%s\n", msg);
+            diag_phase_fail("check_game_files", 3, "%s", msg);
             plat_error_box(msg);
             return 1;
         }
+        diag_phase_end("check_game_files");
     }
     { void fnprof_init(void); fnprof_init(); }
-    crash_handler_install();
     ui_init();
     boot(g_game_dir);
     return ui_run();

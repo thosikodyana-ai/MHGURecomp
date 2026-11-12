@@ -168,8 +168,13 @@ static char *rel_path(File *f) {
 }
 
 bool romfs_open(const char *base_dir, const char *const *overlays, int noverlays) {
+    diag_phase_begin("load_romfs");
     Dir *root = scan(base_dir, "", 0);
-    if (!root) { LOG("[romfs] cannot read %s\n", base_dir); return false; }
+    if (!root) {
+        diag_phase_fail("load_romfs", -1, "cannot read %s", base_dir);
+        LOG("[romfs] cannot read %s\n", base_dir);
+        return false;
+    }
     for (int i = 0; i < noverlays; i++) {
         Dir *o = scan(overlays[i], "", 0);
         if (!o) continue;
@@ -242,6 +247,7 @@ bool romfs_open(const char *base_dir, const char *const *overlays, int noverlays
     g_nfiles = l.nf;
     free(l.dirs);
     LOG("[romfs] %d files, %d folders, image %.1f GB\n", l.nf, l.nd, g_size / 1e9);
+    diag_phase_end("load_romfs");
     return true;
 }
 

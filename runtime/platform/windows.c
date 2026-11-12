@@ -9,6 +9,7 @@
 #include <timeapi.h>
 
 #include "../platform.h"
+#include "../diag.h"
 
 // ---- guest address space
 // The 4 GB window is reserved up front; pages are committed on their first touch by the exception handler below
@@ -143,7 +144,7 @@ void plat_standalone(void) {
     DWORD ids[2];
     if (GetConsoleProcessList(ids, 2) == 1) {  // (from a terminal the terminal shares it: keep logging there)
         FreeConsole();
-        if (freopen("log.txt", "w", stderr)) { setvbuf(stderr, NULL, _IONBF, 0); g_own_log = true; }
+        g_own_log = true;
     }
 }
 
@@ -171,7 +172,11 @@ bool plat_user_dir(char *buf, size_t size) {
     return len > 0 && !lossy;
 }
 
-void plat_error_box(const char *msg) { MessageBoxA(NULL, msg, "MHGU Recomp", MB_OK | MB_ICONERROR); }
+void plat_error_box(const char *msg) {
+    diag_log(DIAG_ERROR, "alert", "%s\n", msg);
+    if (getenv("MHGU_SELFTEST") || getenv("MHGU_HIDDEN")) return;
+    MessageBoxA(NULL, msg, "MHGU Recomp", MB_OK | MB_ICONERROR);
+}
 
 void plat_fatal_notice(void) {
     if (g_own_log)
@@ -231,10 +236,8 @@ static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep) {
 void plat_crash_handler_install(void) {
     ULONG guarantee = 64 << 10;
     SetThreadStackGuarantee(&guarantee);
-    static bool installed;
-    if (installed) return;
-    installed = true;
-    SetUnhandledExceptionFilter(unhandled_filter);
+    diag_install_crash_handlers();
+    (void)unhandled_filter;
 }
 
 // ---- POSIX shims (win_compat.h)

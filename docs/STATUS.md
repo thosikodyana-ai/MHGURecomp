@@ -624,3 +624,15 @@ interpreter, logging every instruction that changes the word at addr),
 `MHGU_SHOT_AT=<frames>`, `MHGU_FPS=1`, `MHGU_VK_STATS=1`, `MHGU_VK_VALIDATION=1`, `MHGU_SYNC_SHADERS=1`, `MHGU_PIPE_WAIT_MS=n`,
 `MHGU_NO_PROGRAM_CACHE=1`, `MHGU_SAVE_GLSL=1`.
 `python tools/disasm.py <game dir> <addr | module:symbol> [count] [before]` disassembles guest code.
+
+## Diagnostic Logging & Crash Subsystem (`runtime/diag.c`, `runtime/diag.h`)
+
+- **Write-Through Crash-Safe Core**: Opens `log.txt` inside `__attribute__((constructor(101)))` using `CreateFileA(..., FILE_FLAG_WRITE_THROUGH)` before guest memory reservation, CPU checks, or `main()`. Every line is written atomically with relative millisecond timestamps, OS thread ID + thread name, level (`TRACE`..`FATAL`), and module tag.
+- **Rotation & Fallback**: Rotates `log.txt -> log.1.txt ... -> log.(N-1).txt` (default `LogKeepFiles = 5`). Falls back to `%LOCALAPPDATA%\MHGURecomp\` if the game folder is read-only.
+- **In-Memory TRACE Ring Buffer**: Keeps the last 256 `TRACE`/`DEBUG` breadcrumbs in a lock-free static ring buffer (`g_trace_ring` in BSS, zero heap allocation) and dumps them chronologically to `log.txt` upon any fatal error or crash.
+- **Startup System Inspection**: Logs build version, git commit hash, compiler flags (`GENARCH`), Windows version/build via `RtlGetVersion`, total/available RAM, CPUID vendor/brand/features (`SSE4.2`, `AVX`, `AVX2`, `FMA3`, `FMA4`, `BMI1`, `BMI2`, `F16C`, `MOVBE`, `TBM`) + `XGETBV(0)` OS YMM state support, SHA-256 of `mhgurecomp.exe` and `mhgugame.dll` (plus `.tramp` section detection), resolved paths, and effective `mhgurecomp.ini`.
+- **Startup Phase Markers**: Tracks start, end, duration (ms), and failure (`GetLastError()` + `FormatMessageA`) across `check_cpu`, `parse_ini`, `check_game_files`, `init_ui`, `load_gamelib`, `load_exefs`, `init_kernel`, `init_vulkan`, `create_swapchain`, `load_romfs`, `init_audio`, `init_video_decoder`, and `start_gameloop`.
+- **Exception, VEH & Minidump Handler**:
+  - `runtime/avx2_bmi2_veh.c` counts emulated instructions per opcode (`MOVBE`, `RORX`, `SHLX`, `SARX`, `SHRX`, `BZHI`, `PEXT`, `PDEP`, `MULX`, `AVX2`) and logs a periodic 5-second summary without flooding hot paths.
+  - Unhandled exceptions (`SetUnhandledExceptionFilter`, tail VEH, and CRT `abort`/`_purecall`/`_invalid_parameter`/signal handlers) log exception code, module+RVA, recompiled guest function `f_<addr>`, 16 instruction bytes at `RIP`, all 16 GPRs, `RIP`, `EFLAGS`, `XMM`/`YMM` registers, Guest ARM32 CPU registers (`r0..r15`, `pc`, `lr`, `sp` + symbol), DbgHelp `StackWalk64` trace, TRACE ring buffer dump, and write a `.dmp` minidump to `crash/`.
+- **Diagnostic Collector**: `tools/collect_diag.ps1` and `tools/collect_diag.bat` (`collect-diag.bat`) package logs, minidumps, `mhgurecomp.ini`, and system info into `diag/MHGURecomp_Diag_<timestamp>.zip` while excluding `exefs/`, `romfs/`, and `save/`.

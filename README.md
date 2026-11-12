@@ -329,3 +329,27 @@ the game or its code, including the recompiled game code a build produces (`mhgu
 This project is not affiliated with or endorsed by Capcom or Nintendo. Monster Hunter is a trademark of Capcom. The
 repository contains no game code, data or keys; the build reads them from a copy you provide. Please support the
 developers by owning the game.
+
+## Logging, Crash Diagnostics & Minidumps
+
+`MHGURecomp` includes a crash-safe, write-through diagnostic logger (`runtime/diag.c`, `runtime/diag.h`) that initializes before any other subsystem, rotates previous log files, records CPUID/XGETBV/Vulkan/SHA-256 system metadata, tracks startup phases and thread lifecycles, monitors for main-loop hangs via a watchdog thread, and generates symbolicated stack traces plus Windows `.dmp` minidumps on any unhandled exception.
+
+### Log & Minidump Locations
+- **Primary Log**: `log.txt` next to `mhgurecomp.exe` (or inside `MHGU_HOME` / `MHGU_LOG_DIR`).
+- **Rotated Logs**: Previous runs are preserved as `log.1.txt`, `log.2.txt`, ..., `log.4.txt` (default 5 files kept).
+- **Read-Only Fallback**: If the game folder cannot be written to (e.g. `C:\Program Files\...`), logs and crash dumps automatically fall back to `%LOCALAPPDATA%\MHGURecomp\` and record the final path on the first line of `log.txt`.
+- **Crash Minidumps**: `crash/crash_<YYYYMMDD_HHMMSS>_pid<PID>_tid<TID>.dmp` (written via `MiniDumpWriteDump` with thread info, data segments, and indirectly referenced memory).
+
+### `mhgurecomp.ini` `[Diagnostics]` Settings & Environment Variables
+| `.ini` Key (`[Diagnostics]`) | Environment Variable | Default | Description |
+| --- | --- | --- | --- |
+| `LogLevel` | `MHGU_LOG_LEVEL` | `INFO` | Verbosity level: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, or `FATAL` |
+| `LogConsole` | `MHGU_LOG_CONSOLE` | `Auto` | Mirror log lines to console/`stderr`: `Auto`, `On` (`1`), or `Off` (`0`) |
+| `LogKeepFiles` | `MHGU_LOG_KEEP` | `5` | Number of rotated `log.*.txt` files to keep (`1..50`) |
+| `WatchdogTimeout` | `MHGU_WATCHDOG_SEC` | `15` | Seconds without frame/loop progress before dumping all thread stacks (`0` = disabled) |
+| `VulkanValidation` | `MHGU_VK_VALIDATION` | `Off` | Enable `VK_LAYER_KHRONOS_validation`: `On` (`1`) or `Off` (`0`) |
+| `CrashMinidump` | — | `On` | Write `.dmp` minidumps to `crash/` on unhandled exceptions: `On` or `Off` |
+| — | `MHGU_LOG_DIR` | — | Override directory for `log.txt` and `crash/` |
+
+### Collecting a Diagnostic Bundle (`collect-diag.bat`)
+Run `collect-diag.bat` (or `powershell -ExecutionPolicy Bypass -File tools/collect_diag.ps1`) to package `log.txt`, `log.*.txt`, recent `crash/*.dmp` minidumps, `mhgurecomp.ini`, and hardware/driver/SHA-256 summary into `diag/MHGURecomp_Diag_<timestamp>.zip`. Game ROM files (`data/exefs`, `data/romfs`) and player saves (`save/`) are never included.

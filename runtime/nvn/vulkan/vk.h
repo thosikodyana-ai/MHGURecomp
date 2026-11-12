@@ -23,7 +23,17 @@
 #include "../nvn.h"
 #include "../maxwell/shader.h"
 
-#define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } while (0)
+uint64_t vk_pending_seq(void);
+uint64_t vk_completed_seq(void);
+uint64_t vk_frame_counter(void);
+#define VK_CHECK(x) do { \
+    VkResult r_ = (x); \
+    if (__builtin_expect(r_ != VK_SUCCESS, 0)) { \
+        if (r_ == VK_ERROR_DEVICE_LOST) \
+            diag_log_vk_device_lost(#x, r_, vk_frame_counter(), vk_pending_seq() - 1, vk_completed_seq()); \
+        FATAL("%s failed: %s (%d) (%s:%d)\n", #x, diag_vk_result_str(r_), r_, __FILE__, __LINE__); \
+    } \
+} while (0)
 
 typedef struct {
     VkInstance inst;

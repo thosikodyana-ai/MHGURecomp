@@ -238,9 +238,28 @@ static void ex_open(Cpu *c, Extractor *e, const char *path) {
     const char *rel = path && strstr(path, ":/") ? strstr(path, ":/") + 2 : path ? path : "";
     const char *host = romfs_host_path(rel);
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host ? host : "(not found)");
-    if (!host || avformat_open_input(&e->fmt, host, NULL, NULL) < 0 || avformat_find_stream_info(e->fmt, NULL) < 0) {
-        LOG("[movie] cannot open %s\n", path ? path : "(null)");
-        if (e->fmt) avformat_close_input(&e->fmt);
+    if (!host) {
+        diag_log(DIAG_ERROR, "movie", "Media Extractor failed: '%s' not found in RomFS (HRESULT=0x80070002)\n",
+                 path ? path : "(null)");
+        RET(MOVIE_ERR);
+        return;
+    }
+    int r_open = avformat_open_input(&e->fmt, host, NULL, NULL);
+    if (r_open < 0) {
+        char errbuf[128] = {0};
+        av_strerror(r_open, errbuf, sizeof errbuf);
+        diag_log(DIAG_ERROR, "movie", "avformat_open_input('%s') failed: av_err=%d (0x%08x: %s) HRESULT=0xC00D36C4\n",
+                 host, r_open, (unsigned)r_open, errbuf);
+        RET(MOVIE_ERR);
+        return;
+    }
+    int r_info = avformat_find_stream_info(e->fmt, NULL);
+    if (r_info < 0) {
+        char errbuf[128] = {0};
+        av_strerror(r_info, errbuf, sizeof errbuf);
+        diag_log(DIAG_ERROR, "movie", "avformat_find_stream_info('%s') failed: av_err=%d (0x%08x: %s) HRESULT=0xC00D36C4\n",
+                 host, r_info, (unsigned)r_info, errbuf);
+        avformat_close_input(&e->fmt);
         RET(MOVIE_ERR);
         return;
     }
@@ -470,16 +489,40 @@ static void dec_signal(Cpu *c, Decoder *d, int i) {
 }
 
 static void dec_configure(Cpu *c) {  // slot 2 (MediaData *)
+    static bool first_video_phase = true;
+    if (first_video_phase) diag_phase_begin("init_video_decoder");
     Decoder *d = self_state(c);
     AVCodecParameters *p = md(ARG(1))->codecpar;
-    if (!p) { LOG("[movie] Configure without codec parameters\n"); RET(MOVIE_ERR); return; }
-    av_force_cpu_flags(av_get_cpu_flags() & ~(AV_CPU_FLAG_AVX2 | AV_CPU_FLAG_BMI2 | AV_CPU_FLAG_AVX512 | AV_CPU_FLAG_AVX512ICL));
+    if (!p) {
+        diag_log(DIAG_ERROR, "movie", "Decoder::Configure called without codec parameters (HRESULT=0x80070057)\n");
+        if (first_video_phase) { first_video_phase = false; diag_phase_fail("init_video_decoder", -1, "missing codecpar"); }
+        RET(MOVIE_ERR);
+        return;
+    }
+    int cpu_flags_before = av_get_cpu_flags();
+    int cpu_flags_after = cpu_flags_before & ~(AV_CPU_FLAG_AVX2 | AV_CPU_FLAG_BMI2 | AV_CPU_FLAG_AVX512 | AV_CPU_FLAG_AVX512ICL);
+    av_force_cpu_flags(cpu_flags_after);
     const AVCodec *codec = avcodec_find_decoder(p->codec_id);
-    if (!codec) { LOG("[movie] no decoder for codec %d\n", p->codec_id); RET(MOVIE_ERR); return; }
+    if (!codec) {
+        diag_log(DIAG_ERROR, "movie", "avcodec_find_decoder(codec_id=%d) failed: codec not supported (HRESULT=0xC00D5212)\n",
+                 p->codec_id);
+        if (first_video_phase) { first_video_phase = false; diag_phase_fail("init_video_decoder", p->codec_id, "no decoder"); }
+        RET(MOVIE_ERR);
+        return;
+    }
     d->ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(d->ctx, p);
     d->ctx->thread_count = 4;
-    if (avcodec_open2(d->ctx, codec, NULL) < 0) { LOG("[movie] cannot open decoder\n"); RET(MOVIE_ERR); return; }
+    int r_open = avcodec_open2(d->ctx, codec, NULL);
+    if (r_open < 0) {
+        char errbuf[128] = {0};
+        av_strerror(r_open, errbuf, sizeof errbuf);
+        diag_log(DIAG_ERROR, "movie", "avcodec_open2(%s) failed: av_err=%d (0x%08x: %s) HRESULT=0xC00D36B4\n",
+                 codec->name, r_open, (unsigned)r_open, errbuf);
+        if (first_video_phase) { first_video_phase = false; diag_phase_fail("init_video_decoder", r_open, "avcodec_open2 failed"); }
+        RET(MOVIE_ERR);
+        return;
+    }
     d->frame = av_frame_alloc();
     d->pkt = av_packet_alloc();
     d->video = p->codec_type == AVMEDIA_TYPE_VIDEO;
@@ -492,7 +535,9 @@ static void dec_configure(Cpu *c) {  // slot 2 (MediaData *)
     d->out_cap = d->video ? (uint32_t)(d->stride * d->height * 3 / 2 + d->stride) : 64 << 10;
     for (int i = 0; i < NIN; i++) d->in_mem[i] = buf_get(d->in_cap);
     for (int i = 0; i < NOUT; i++) d->out_mem[i] = buf_get(d->out_cap);
-    LOG("[movie] decoder %s configured: %dx%d %d Hz %d ch\n", codec->name, d->width, d->height, d->sample_rate, d->channels);
+    LOG("[movie] decoder %s configured: %dx%d %d Hz %d ch (ffmpeg cpu_flags: 0x%x -> 0x%x)\n",
+        codec->name, d->width, d->height, d->sample_rate, d->channels, cpu_flags_before, cpu_flags_after);
+    if (first_video_phase) { first_video_phase = false; diag_phase_end("init_video_decoder"); }
     RET(0);
 }
 
@@ -661,7 +706,13 @@ static void dec_send_input(Cpu *c) {
         d->pkt->data = (uint8_t *)G2H(d->in_mem[idx]) + off;
         d->pkt->size = size;
         d->pkt->pts = time;
-        avcodec_send_packet(d->ctx, d->pkt);
+        int r_send = avcodec_send_packet(d->ctx, d->pkt);
+        if (r_send < 0 && r_send != AVERROR(EAGAIN) && r_send != AVERROR_EOF) {
+            char errbuf[128] = {0};
+            av_strerror(r_send, errbuf, sizeof errbuf);
+            diag_log(DIAG_WARN, "movie", "avcodec_send_packet(%s, pts=%lld, size=%d) error: %d (0x%08x: %s) HRESULT=0xC00D36B2\n",
+                     d->video ? "video" : "audio", (long long)time, size, r_send, (unsigned)r_send, errbuf);
+        }
     }
     if (flags & MOVIE_EOS) avcodec_send_packet(d->ctx, NULL);
     bool produced = false;

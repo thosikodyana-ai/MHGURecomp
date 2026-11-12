@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-windows-non-avx2:
-    name: Windows UCRT64 Non-AVX2 v3 (AMD A10-7800 Movie06 Fix)
+    name: Windows UCRT64 Non-AVX2 v3 (AMD A10-7800 + Full Crash Diagnostics)
     runs-on: windows-latest
     defaults:
       run:
@@ -50,13 +50,13 @@ jobs:
             mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-vulkan-memory-allocator
 
-      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + Movie06 FFmpeg Fix + XSAVE YMM Mask Fix)
+      - name: Compile mhgurecomp.exe (Non-AVX2 bdver3 + Crash Diagnostics + Movie06 Fix)
         run: |
           TARGET_ARCH="${{ inputs.genarch || '-march=bdver3 -mtune=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe' }}"
           echo "Compiling with GENARCH: $TARGET_ARCH"
           make -j4 build/mhgurecomp.exe bundle licenses GEN_SRC="" GENARCH="$TARGET_ARCH"
 
-      - name: Fetch Official Release 0.10.1 & Run v3 AOT .tramp Patcher (19,953 Sites) on mhgugame.dll
+      - name: Fetch Official Release 0.10.1 & Run v3.1 AOT .tramp Patcher on mhgugame.dll
         run: |
           curl -fL --retry 3 -o official_release.zip https://github.com/morerokk/MHGURecomp/releases/download/0.10.1/Windows-MHGURecomp.0.10.1.zip
           unzip -q official_release.zip -d official_rel
@@ -66,10 +66,65 @@ jobs:
           cp -rf official_rel/Windows-MHGURecomp/data build/ 2>/dev/null || true
           cp -rf official_rel/Windows-MHGURecomp/mods build/ 2>/dev/null || true
           python3 tools/patch_mhgugame_dll.py build/mhgugame.dll
+          mkdir -p build/tools
+          cp -f tools/collect_diag.ps1 tools/collect_diag.bat build/tools/
+          cp -f collect-diag.bat build/
+
+      - name: Verify Crash Diagnostics, Log Rotation, Fallback Path & Minidumps (3 Scenarios)
+        run: |
+          mkdir -p test_verif/game_dir
+          cp -rf build/* test_verif/game_dir/
+
+          echo "=================================================================="
+          echo "SCENARIO A: NULL Pointer Dereference Crash (MHGU_SELFTEST=null_crash)"
+          echo "=================================================================="
+          (cd test_verif/game_dir && MHGU_SELFTEST=null_crash MHGU_LOG_CONSOLE=0 ./mhgurecomp.exe || true)
+          ls -la test_verif/game_dir/ test_verif/game_dir/crash/
+          cat test_verif/game_dir/log.txt
+          test -f test_verif/game_dir/log.txt
+          grep -q "EXCEPTION_ACCESS_VIOLATION" test_verif/game_dir/log.txt
+          grep -q "Host Stack Trace" test_verif/game_dir/log.txt
+          grep -q "Minidump written successfully" test_verif/game_dir/log.txt
+
+          echo "=================================================================="
+          echo "SCENARIO B: Unhandled Illegal Instruction (MHGU_SELFTEST=illegal_insn) + Log Rotation"
+          echo "=================================================================="
+          (cd test_verif/game_dir && MHGU_SELFTEST=illegal_insn MHGU_LOG_CONSOLE=0 ./mhgurecomp.exe || true)
+          ls -la test_verif/game_dir/log*.txt test_verif/game_dir/crash/
+          cat test_verif/game_dir/log.txt
+          test -f test_verif/game_dir/log.1.txt
+          grep -q "EXCEPTION_ILLEGAL_INSTRUCTION" test_verif/game_dir/log.txt
+          grep -q "Insn Bytes \[16\]: 0f 0b" test_verif/game_dir/log.txt
+          grep -q "Minidump written successfully" test_verif/game_dir/log.txt
+
+          echo "=================================================================="
+          echo "SCENARIO C: Forced Vulkan Init Failure (MHGU_SELFTEST=vk_fail) + Log Rotation"
+          echo "=================================================================="
+          (cd test_verif/game_dir && MHGU_SELFTEST=vk_fail MHGU_LOG_CONSOLE=0 ./mhgurecomp.exe || true)
+          ls -la test_verif/game_dir/log*.txt test_verif/game_dir/crash/
+          cat test_verif/game_dir/log.txt
+          test -f test_verif/game_dir/log.2.txt
+          grep -q "PHASE BEGIN: init_vulkan" test_verif/game_dir/log.txt
+          grep -q "VK_ERROR_INITIALIZATION_FAILED" test_verif/game_dir/log.txt
+          grep -q "PHASE FAILED: init_vulkan" test_verif/game_dir/log.txt
+          grep -q "Minidump written successfully" test_verif/game_dir/log.txt
+
+          echo "=================================================================="
+          echo "SCENARIO D: Unwritable Game Folder Fallback to %LOCALAPPDATA%\MHGURecomp + collect_diag.ps1"
+          echo "=================================================================="
+          (cd test_verif/game_dir && MHGU_TEST_READONLY_LOG=1 MHGU_SELFTEST=vk_fail MHGU_LOG_CONSOLE=0 ./mhgurecomp.exe || true)
+          FALLBACK_LOG="$(cygpath -u "$LOCALAPPDATA")/MHGURecomp/log.txt"
+          ls -la "$(cygpath -u "$LOCALAPPDATA")/MHGURecomp/"
+          head -n 25 "$FALLBACK_LOG"
+          grep -q "fell back to %LOCALAPPDATA%" "$FALLBACK_LOG"
+
+          (cd test_verif/game_dir && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/collect_diag.ps1)
+          ls -lh test_verif/game_dir/diag/
+          rm -rf test_verif
 
       - name: Package Ready-to-Play Non-AVX2 v3 Zip Archives
         run: |
-          (cd build && zip -r9 ../MHGURecomp-v3-Movie06-Fix-Patch.zip mhgugame.dll mhgurecomp.exe)
+          (cd build && zip -r9 ../MHGURecomp-v3-Movie06-Fix-Patch.zip mhgugame.dll mhgurecomp.exe collect-diag.bat tools/collect_diag.ps1 tools/collect_diag.bat)
           mv build Windows-MHGURecomp-NonAVX2-A10-7800-v3
           zip -r9 Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip Windows-MHGURecomp-NonAVX2-A10-7800-v3
           ls -lh MHGURecomp-v3-Movie06-Fix-Patch.zip Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip
@@ -87,16 +142,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.10.1-non-avx2-a10-7800-v3
-          name: "MHGURecomp 0.10.1 Non-AVX2 v3 (Movie06 Black Screen Fix · 19,953 Static AOT .tramp Patch)"
+          name: "MHGURecomp 0.10.1 Non-AVX2 v3.2 (Movie06 Fix + Crash Diagnostics & Minidump Logger)"
           body: |
-            ### Native Non-AVX2 v3 Build for AMD A10-7800 (Steamroller / bdver3) — Movie06.mp4 Black Screen Fix
-            - **Fixed `movie06.mp4` Black Screen After Capcom Logo**:
-              - **100% Static AOT Binary Translation (`mhgugame.dll`)**: Appends executable `.tramp` section (`RVA 0x057af000`) and translates all **19,953 non-bdver3 instructions** (`10,068 RORX`, `4,846 SHLX`, `3,338 SHRX`, `971 MOVBE`, `648 SARX`, `57 BZHI`, `23 VPBROADCASTD`, `2 VPBROADCASTB`) ahead-of-time into native AMD A10-7800 instructions, eliminating the 6-thread H.264/AAC VEH exception lock contention (`0` `#UD` exceptions at runtime).
-              - **FFmpeg H.264/AAC CPU Flags (`runtime/hle/movie.c` + `Makefile`)**: Forces FFmpeg to mask out `AV_CPU_FLAG_AVX2`, `AV_CPU_FLAG_BMI2`, and `AV_CPU_FLAG_AVX512` and compiles bundled FFmpeg with `GENARCH` (`-march=bdver3 -mno-avx2 -mno-bmi2 -mno-movbe`).
-              - **XSAVE YMM Upper-Lane Restoration (`runtime/avx2_bmi2_veh.c`)**: Sets `XSTATE_MASK_AVX` in `XSAVE_HEADER.Mask` inside `write_ymm`.
-            - **Download Options**:
-              - **`MHGURecomp-v3-Movie06-Fix-Patch.zip`**: Lightweight patch containing `mhgugame.dll` + `mhgurecomp.exe` (extract & overwrite into your existing v2 folder).
-              - **`Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip`**: Complete standalone ready-to-play v3 bundle.
+            ### Native Non-AVX2 v3.2 Build for AMD A10-7800 (Steamroller / bdver3) — Movie06 Fix + Crash Diagnostics Logger
+            - **Fixed `init sdk` Force Close & `movie06.mp4` Black Screen**:
+              - **Static AOT Binary Translation (`mhgugame.dll` v3.1)**: Preserves `%rcx` (`Cpu *c` guest pointer) across `SHLX`/`SHRX`/`SARX`/`BZHI` and `MOVBE` stores; translates 19,859 5+ byte BMI2/MOVBE/AVX2 sites in `.tramp` while leaving 94 4-byte `MOVBE` instructions to `emulate_movbe` so zero adjacent instructions are ever overwritten.
+              - **FFmpeg H.264/AAC CPU Flags (`runtime/hle/movie.c` + `Makefile`)**: Masks out `AV_CPU_FLAG_AVX2`, `AV_CPU_FLAG_BMI2`, and `AV_CPU_FLAG_AVX512` and compiles bundled FFmpeg with `GENARCH`.
+            - **Full Crash-Safe Logger & Minidump Diagnostics (`runtime/diag.c`, `runtime/diag.h`)**:
+              - Write-through unbuffered logging (`FILE_FLAG_WRITE_THROUGH`), automatic log rotation (`log.txt`, `log.1.txt`..`log.4.txt`), and fallback to `%LOCALAPPDATA%\MHGURecomp\` if the game folder is read-only.
+              - Logs CPUID/XGETBV features, OS version/RAM, GPU/VRAM/Vulkan queue & `VkResult` names, SHA-256 of `mhgurecomp.exe` and `mhgugame.dll`, and startup phase durations.
+              - Captures unhandled exceptions (`SetUnhandledExceptionFilter`, VEH, CRT handlers), dumps all GPR/XMM/YMM + Guest ARM32 registers, 16 instruction bytes at `RIP`, in-memory `TRACE` ring buffer, `DbgHelp` `StackWalk64` trace, and writes `crash/crash_*.dmp` minidumps.
+              - Includes `collect-diag.bat` / `tools/collect_diag.ps1` to package logs and minidumps into `diag/MHGURecomp_Diag_*.zip`.
           files: |
             MHGURecomp-v3-Movie06-Fix-Patch.zip
             Windows-MHGURecomp-NonAVX2-A10-7800-v3.zip

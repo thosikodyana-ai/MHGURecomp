@@ -980,6 +980,7 @@ static void wav_header(FILE *f, uint32_t bytes) {
 
 static void *renderer_tick(void *arg) {
     Renderer *r = arg;
+    diag_thread_register("audio:audren", 0, 0);
     float out[2 * 4096];
     uint32_t N = r->sample_count > 4096 ? 4096 : r->sample_count;
     int frame_bytes = (int)(N * 2 * sizeof(float));
@@ -1027,6 +1028,7 @@ static void *renderer_tick(void *arg) {
         kernel_signal(r->event);
         pthread_mutex_unlock(&g_klock);
     }
+    diag_thread_unregister();
     return NULL;
 }
 
@@ -1383,6 +1385,8 @@ SERVICE("audren:u", audren_u) {
     (void)s;
     switch (req->cmd) {
     case 0: {  // OpenAudioRenderer(params, work size, aruid, pid, transfer mem, process)
+        static bool first_audio_phase = true;
+        if (first_audio_phase) diag_phase_begin("init_audio");
         Renderer *r = calloc(1, sizeof *r);
         const uint32_t *p = (const uint32_t *)req->data;
         r->sample_rate = p[0]; r->sample_count = p[1]; r->mix_buffers = p[2]; r->submixes = p[3];
@@ -1405,6 +1409,7 @@ SERVICE("audren:u", audren_u) {
         LOG("[audren] renderer %u Hz, %u samples/frame, %u voices, %u mixes, %u mix buffers, %u splitters, %u effects, revision %.4s\n",
             r->sample_rate, r->sample_count, r->voices, r->nmix, r->mix_buffers, r->splitters, r->effects, (const char *)&r->revision);
         ipc_return_object(resp, service_new("IAudioRenderer", audio_renderer, r));
+        if (first_audio_phase) { first_audio_phase = false; diag_phase_end("init_audio"); }
         break;
     }
     case 1: OUT(uint64_t, 0) = 0x1000000; resp_size(resp, 8); break;  // GetWorkBufferSize: 16 MB
@@ -1490,6 +1495,7 @@ RT_ON_RESET(audio_reset) {
 // stream plays the role of the hardware queue. Without a device, buffers are released in real time.
 static void *audout_thread(void *arg) {
     AudioOut *a = arg;
+    diag_thread_register("audio:audout", 0, 0);
     uint32_t ch = a->channels ? a->channels : 2;
     int target = 0;
     if (a->stream) {

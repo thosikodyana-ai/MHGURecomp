@@ -6,10 +6,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include "platform.h"
+#include "diag.h" 
 
 typedef struct {
     uint8_t b[32];
@@ -1254,19 +1257,118 @@ static bool emulate_avx2(PCONTEXT ctx, const uint8_t *ip, int pos_op, int mmmmm,
     return false;
 }
 
+enum {
+    VEH_OP_MOVBE = 0,
+    VEH_OP_RORX,
+    VEH_OP_SHLX,
+    VEH_OP_SARX,
+    VEH_OP_SHRX,
+    VEH_OP_BZHI,
+    VEH_OP_PEXT,
+    VEH_OP_PDEP,
+    VEH_OP_MULX,
+    VEH_OP_AVX2_C4,
+    VEH_OP_AVX2_C5,
+    VEH_OP_COUNT
+};
+
+static const char *const g_veh_op_names[VEH_OP_COUNT] = {
+    "MOVBE", "RORX", "SHLX", "SARX", "SHRX",
+    "BZHI", "PEXT", "PDEP", "MULX", "AVX2_VEX3", "AVX2_VEX2"
+};
+
+static _Atomic uint64_t g_veh_counts[VEH_OP_COUNT];
+static _Atomic uint64_t g_veh_total;
+static _Atomic uint64_t g_veh_last_log_total;
+static _Atomic uint64_t g_veh_last_log_ns;
+
+static int classify_bmi2_op(const uint8_t *ip, int mmmmm, int pp) {
+    uint8_t op = ip[3];
+    if (mmmmm == 3 && op == 0xF0 && pp == 3) return VEH_OP_RORX;
+    if (mmmmm == 2 && op == 0xF7) {
+        if (pp == 1) return VEH_OP_SHLX;
+        if (pp == 2) return VEH_OP_SARX;
+        if (pp == 3) return VEH_OP_SHRX;
+    }
+    if (mmmmm == 2 && op == 0xF5) {
+        if (pp == 0) return VEH_OP_BZHI;
+        if (pp == 2) return VEH_OP_PEXT;
+        if (pp == 3) return VEH_OP_PDEP;
+    }
+    if (mmmmm == 2 && op == 0xF6 && pp == 3) return VEH_OP_MULX;
+    return VEH_OP_RORX;
+}
+
+static void veh_record_emulated(int op_kind, uint64_t rip) {
+    uint64_t prev_op = atomic_fetch_add(&g_veh_counts[op_kind], 1);
+    uint64_t total = atomic_fetch_add(&g_veh_total, 1) + 1;
+
+    if (prev_op == 0) {
+        diag_log(DIAG_DEBUG, "veh", "First emulated %s instruction at RIP=0x%016llx
+",
+                 g_veh_op_names[op_kind], (unsigned long long)rip);
+    } else if (__builtin_expect(g_diag_level <= DIAG_TRACE, 0)) {
+        diag_trace_ring_push("veh", "Emulated %s at RIP=0x%016llx (total=%llu)",
+                             g_veh_op_names[op_kind], (unsigned long long)rip, (unsigned long long)total);
+    }
+
+    // Check periodic 5-second summary every 64 emulated exceptions (fast bitmask check)
+    if ((total & 63u) == 0 || total == 1) {
+        uint64_t now = plat_now_ns();
+        uint64_t last_ns = atomic_load(&g_veh_last_log_ns);
+        if (last_ns == 0) {
+            atomic_compare_exchange_strong(&g_veh_last_log_ns, &last_ns, now);
+        } else if (now - last_ns >= 5000000000ull) {
+            if (atomic_compare_exchange_strong(&g_veh_last_log_ns, &last_ns, now)) {
+                uint64_t prev_tot = atomic_exchange(&g_veh_last_log_total, total);
+                uint64_t delta = total - prev_tot;
+                char summary[512];
+                int pos = 0;
+                for (int i = 0; i < VEH_OP_COUNT; i++) {
+                    uint64_t c = atomic_load(&g_veh_counts[i]);
+                    if (c > 0 && pos < (int)sizeof(summary) - 48) {
+                        pos += snprintf(summary + pos, sizeof(summary) - (size_t)pos, "%s=%llu ",
+                                        g_veh_op_names[i], (unsigned long long)c);
+                    }
+                }
+                summary[pos] = 0;
+                diag_log(DIAG_INFO, "veh", "Periodic 5s summary: +%llu emulated (%llu total) | %s
+",
+                         (unsigned long long)delta, (unsigned long long)total, summary);
+            }
+        }
+    }
+}
+
 static LONG CALLBACK mhgu_non_avx2_veh(PEXCEPTION_POINTERS ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    PCONTEXT ctx = ep->ContextRecord;
+    uint64_t rip = ctx->Rip;
+
+    if (code != EXCEPTION_ILLEGAL_INSTRUCTION) {
+        // Ignore guest lazy-commit page faults (handled by windows.c vectored_handler) and benign debug exceptions
+        if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+            uint64_t fa = ep->ExceptionRecord->ExceptionInformation[1];
+            if (fa >= 0x10000000000ull && fa < 0x10100000000ull) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        }
+        if (code != 0x40010006u && code != 0x4001000Au && code != 0x406D1388u &&
+            code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) {
+            diag_trace_ring_push("veh", "Non-UD exception 0x%08lx at RIP=0x%016llx",
+                                 (unsigned long)code, (unsigned long long)rip);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    PCONTEXT ctx = ep->ContextRecord;
-    const uint8_t *ip = (const uint8_t *)ctx->Rip;
+    const uint8_t *ip = (const uint8_t *)(uintptr_t)rip;
 
     // 1. Check Legacy 0F 38 F0 / 0F 38 F1 MOVBE instructions (not supported on AMD A10-7800 bdver3)
     if (emulate_movbe(ctx, ip)) {
+        veh_record_emulated(VEH_OP_MOVBE, rip);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -1284,9 +1386,11 @@ static LONG CALLBACK mhgu_non_avx2_veh(PEXCEPTION_POINTERS ep) {
         int pp = b2 & 0x03;
 
         if (L == 0 && emulate_bmi2(ctx, ip, mmmmm, W, vvvv, pp, rex_r, rex_x, rex_b)) {
+            veh_record_emulated(classify_bmi2_op(ip, mmmmm, pp), rip);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (emulate_avx2(ctx, ip, 3, mmmmm, W, vvvv, L, pp, rex_r, rex_x, rex_b)) {
+            veh_record_emulated(VEH_OP_AVX2_C4, rip);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1300,11 +1404,17 @@ static LONG CALLBACK mhgu_non_avx2_veh(PEXCEPTION_POINTERS ep) {
         int pp = b1 & 0x03;
 
         if (emulate_avx2(ctx, ip, 2, 1, 0, vvvv, L, pp, rex_r, 0, 0)) {
+            veh_record_emulated(VEH_OP_AVX2_C5, rip);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
-    return EXCEPTION_CONTINUE_SEARCH;
+    // Unhandled EXCEPTION_ILLEGAL_INSTRUCTION: log full diagnostic report, stack trace, and minidump immediately!
+    diag_log(DIAG_FATAL, "veh", "Unhandled EXCEPTION_ILLEGAL_INSTRUCTION at RIP=0x%016llx (total emulated so far: %llu)
+",
+             (unsigned long long)rip, (unsigned long long)atomic_load(&g_veh_total));
+    diag_report_unhandled_exception(ep, "veh_unhandled_illegal_insn");
+    _exit(1);
 }
 
 __attribute__((constructor(102))) static void install_mhgu_non_avx2_veh(void) {

@@ -39,11 +39,19 @@ void vk_lock(void) {
 void vk_unlock(void) { pthread_mutex_unlock(&g_vk_mutex); }
 
 // ================================================================== instance / device
+static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return true;
+    return false;
+}
+
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
     (void)type, (void)user;
     static int n;
-    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && n++ < 500) LOG("[vk] %s\n", d->pMessage);
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && n++ < 500) {
+        DiagLevel lvl = (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? DIAG_ERROR : DIAG_WARN;
+        diag_log(lvl, "vk:dbg", "%s\n", d->pMessage ? d->pMessage : "(null)");
+    }
     return VK_FALSE;
 }
 
@@ -58,14 +66,27 @@ static void disable_overwolf_layers(void) {
 
 static void create_instance(void) {
     disable_overwolf_layers();
+    uint32_t inst_ver = VK_API_VERSION_1_0;
+    vkEnumerateInstanceVersion(&inst_ver);
+    diag_log(DIAG_INFO, "vk", "Vulkan Loader Instance Version: %u.%u.%u\n",
+             VK_API_VERSION_MAJOR(inst_ver), VK_API_VERSION_MINOR(inst_ver), VK_API_VERSION_PATCH(inst_ver));
+
+    uint32_t n_inst_ext = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &n_inst_ext, NULL);
+    VkExtensionProperties *inst_exts = n_inst_ext ? calloc(n_inst_ext, sizeof *inst_exts) : NULL;
+    if (inst_exts) vkEnumerateInstanceExtensionProperties(NULL, &n_inst_ext, inst_exts);
+    bool have_debug_utils = inst_exts && has_ext(inst_exts, n_inst_ext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    free(inst_exts);
+
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
     if (!sdl_ext) FATAL("SDL_Vulkan_GetInstanceExtensions: %s (is the window a Vulkan window?)\n", SDL_GetError());
     const char *ext[16];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
-    bool validate = getenv("MHGU_VK_VALIDATION") != NULL;
-    if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    if (have_debug_utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+
+    bool validate = g_diag_vk_validation != 0 || getenv("MHGU_VK_VALIDATION") != NULL;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "MHGURecomp",
                              .pEngineName = "MHGURecomp", .apiVersion = VK_API_VERSION_1_2};
@@ -73,29 +94,29 @@ static void create_instance(void) {
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    diag_log_vk_create("vkCreateInstance", r, validate ? "with VK_LAYER_KHRONOS_validation" : "standard");
     if (r != VK_SUCCESS && validate) {
-        LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
+        LOG("[vk] validation layer unavailable (%s / %d); continuing without\n", diag_vk_result_str(r), r);
         ci.enabledLayerCount = 0;
-        ci.enabledExtensionCount--;
         validate = false;
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+        diag_log_vk_create("vkCreateInstance (retry without validation)", r, NULL);
     }
-    if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.2 driver installed?)\n", r);
-    if (validate) {
+    if (r != VK_SUCCESS) FATAL("vkCreateInstance: %s (%d) (is a Vulkan 1.2 driver installed?)\n", diag_vk_result_str(r), r);
+    if (have_debug_utils) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCreateDebugUtilsMessengerEXT");
         VkDebugUtilsMessengerCreateInfoEXT mi = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
             .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
-            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = debug_cb};
-        if (f) f(g_vk.inst, &mi, NULL, &messenger);
+        if (f) {
+            VkResult mr = f(g_vk.inst, &mi, NULL, &messenger);
+            diag_log_vk_create("vkCreateDebugUtilsMessengerEXT", mr, validate ? "validation=ON" : "validation=OFF");
+        }
     }
-}
-
-static bool has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
-    for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return true;
-    return false;
 }
 
 // Discrete GPU first (MHGU_GPU=<index> picks one); needs Vulkan 1.2 and a queue that can draw, compute and present.
@@ -130,9 +151,31 @@ static void pick_device(void) {
         vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
     }
+    for (uint32_t i = 0; i < nq; i++) {
+        VkBool32 present = VK_FALSE;
+        vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
+        diag_log(DIAG_INFO, "vk", "QueueFamily[%u]: count=%u flags=0x%x (GFX=%d COMP=%d XFER=%d PRESENT=%d)\n",
+                 i, qp[i].queueCount, qp[i].queueFlags,
+                 (qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0,
+                 (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0,
+                 (qp[i].queueFlags & VK_QUEUE_TRANSFER_BIT) != 0,
+                 present != 0);
+    }
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
-    LOG("[vk] using %s, driver %#x\n", g_vk.props.deviceName, g_vk.props.driverVersion);
+
+    VkPhysicalDeviceMemoryProperties memp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &memp);
+    uint64_t vram_local = 0, vram_shared = 0;
+    for (uint32_t i = 0; i < memp.memoryHeapCount; i++) {
+        if (memp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram_local += memp.memoryHeaps[i].size;
+        else vram_shared += memp.memoryHeaps[i].size;
+    }
+    LOG("[vk] using %s (vendor=0x%04x device=0x%04x), driver %#x, api %u.%u.%u, queueFamily=%u, VRAM=%llu MB (shared=%llu MB)\n",
+        g_vk.props.deviceName, g_vk.props.vendorID, g_vk.props.deviceID, g_vk.props.driverVersion,
+        VK_API_VERSION_MAJOR(g_vk.props.apiVersion), VK_API_VERSION_MINOR(g_vk.props.apiVersion),
+        VK_API_VERSION_PATCH(g_vk.props.apiVersion), g_vk.qfam,
+        (unsigned long long)(vram_local >> 20), (unsigned long long)(vram_shared >> 20));
 }
 
 static void create_device(void) {
@@ -204,9 +247,23 @@ static void create_device(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
+    char ext_list[256] = "";
+    for (uint32_t i = 0; i < n_ext; i++) {
+        if (i) strncat(ext_list, ", ", sizeof(ext_list) - strlen(ext_list) - 1);
+        strncat(ext_list, ext[i], sizeof(ext_list) - strlen(ext_list) - 1);
+    }
+    diag_log(DIAG_INFO, "vk", "Enabled Device Extensions (%u): %s\n", n_ext, ext_list);
+
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    if ((getenv("MHGU_SELFTEST") && !strcmp(getenv("MHGU_SELFTEST"), "vk_fail")) || getenv("MHGU_FORCE_VK_FAIL")) {
+        VkResult forced = VK_ERROR_INITIALIZATION_FAILED;
+        diag_log_vk_create("vkCreateDevice", forced, "forced failure via MHGU_SELFTEST=vk_fail");
+        VK_CHECK(forced);
+    }
+    VkResult dev_r = vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev);
+    diag_log_vk_create("vkCreateDevice", dev_r, g_vk.props.deviceName);
+    VK_CHECK(dev_r);
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
     LOG("[vk] features: divisor %d, custom border %d, BC %d, ASTC %d\n", g_vk.divisor, g_vk.custom_border,
         h->textureCompressionBC, h->textureCompressionASTC_LDR);
@@ -336,7 +393,9 @@ static void create_swapchain(void) {
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
         .oldSwapchain = old};
-    VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
+    VkResult sc_r = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain);
+    diag_log_vk_create("vkCreateSwapchainKHR", sc_r, NULL);
+    VK_CHECK(sc_r);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         vkDestroyFramebuffer(g_vk.dev, sc_fb[i], NULL);
         vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
@@ -359,7 +418,9 @@ static void create_swapchain(void) {
                                    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
         VkRenderPassCreateInfo rp = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1, .pAttachments = &a,
                                      .subpassCount = 1, .pSubpasses = &sp, .dependencyCount = 1, .pDependencies = &dep};
-        VK_CHECK(vkCreateRenderPass(g_vk.dev, &rp, NULL, &sc_pass));
+        VkResult rp_r = vkCreateRenderPass(g_vk.dev, &rp, NULL, &sc_pass);
+        diag_log_vk_create("vkCreateRenderPass(window)", rp_r, NULL);
+        VK_CHECK(rp_r);
     }
     g_vk.sc_count = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
@@ -416,7 +477,14 @@ static bool frame_begin(void) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
+    if (r == VK_ERROR_DEVICE_LOST) {
+        diag_log_vk_device_lost("vkAcquireNextImageKHR", r, g_frames, vk_pending_seq() - 1, vk_completed_seq());
+        FATAL("vkAcquireNextImageKHR: %s (%d)\n", diag_vk_result_str(r), r);
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        LOG("[vk] acquire failed: %s (%d)\n", diag_vk_result_str(r), r);
+        return false;
+    }
     cur_frame.acquired = acquire_sem[slot];
     slot_seq[slot] = vk_pending_seq();
     VkCommandBuffer cb = vk_cmd();
@@ -481,6 +549,10 @@ static void frame_end(const char *shot_path) {
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    if (r == VK_ERROR_DEVICE_LOST) {
+        diag_log_vk_device_lost("vkQueuePresentKHR", r, g_frames, vk_pending_seq() - 1, vk_completed_seq());
+        FATAL("vkQueuePresentKHR: %s (%d)\n", diag_vk_result_str(r), r);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     cur_frame.ok = false;
     if (shot_path) {  // (the copy is taken here; the PNG is made on a thread of its own: encoding the window's size
@@ -610,13 +682,37 @@ void backend_init(void) {
     static bool done;
     if (done) return;
     done = true;
+    diag_phase_begin("init_vulkan");
+    if ((getenv("MHGU_SELFTEST") && !strcmp(getenv("MHGU_SELFTEST"), "vk_fail")) || getenv("MHGU_FORCE_VK_FAIL")) {
+        diag_trace_ring_push("vk", "Entering backend_init with MHGU_SELFTEST=vk_fail active");
+        uint32_t inst_ver = VK_API_VERSION_1_0;
+        vkEnumerateInstanceVersion(&inst_ver);
+        diag_log(DIAG_INFO, "vk", "Vulkan Loader Instance Version: %u.%u.%u\n",
+                 VK_API_VERSION_MAJOR(inst_ver), VK_API_VERSION_MINOR(inst_ver), VK_API_VERSION_PATCH(inst_ver));
+        VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "MHGURecomp",
+                                 .pEngineName = "MHGURecomp", .apiVersion = VK_API_VERSION_1_2};
+        VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+        VkResult ir = vkCreateInstance(&ci, NULL, &g_vk.inst);
+        diag_log_vk_create("vkCreateInstance", ir, "selftest probe");
+        VkResult forced = VK_ERROR_INITIALIZATION_FAILED;
+        diag_log_vk_create("vkCreateDevice", forced, "forced failure during init_vulkan via MHGU_SELFTEST=vk_fail");
+        VK_CHECK(forced);
+    }
     if (!ui_window()) FATAL("no window\n");
     create_instance();
     if (!SDL_Vulkan_CreateSurface(ui_window(), g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    if ((getenv("MHGU_SELFTEST") && !strcmp(getenv("MHGU_SELFTEST"), "vk_fail")) || getenv("MHGU_FORCE_VK_FAIL")) {
+        VkResult forced = VK_ERROR_INITIALIZATION_FAILED;
+        diag_log_vk_create("vkCreateDevice", forced, "forced failure during init_vulkan via MHGU_SELFTEST=vk_fail");
+        VK_CHECK(forced);
+    }
     pick_device();
     create_device();
     vk_exec_init();
     vk_shaders_init();
+    diag_phase_end("init_vulkan");
+    diag_phase_begin("create_swapchain");
     create_swapchain();
+    diag_phase_end("create_swapchain");
     atexit(exit_handler);
 }

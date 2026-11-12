@@ -62,6 +62,7 @@ static void set_fullscreen(bool on) {
 }
 
 void ui_init(void) {
+    diag_phase_begin("init_ui");
     if (!SDL_Init(SDL_INIT_VIDEO)) FATAL("SDL_Init: %s\n", SDL_GetError());
     config_load();
     // the controller in the background (ini BackgroundInput): SDL's hint, set before its gamepads start (some of its
@@ -78,6 +79,7 @@ void ui_init(void) {
     window = SDL_CreateWindow("Monster Hunter Generations Ultimate", win_w, win_h, flags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     if (g_config.display_mode != DISPLAY_WINDOWED) set_fullscreen(true);
+    diag_phase_end("init_ui");
 }
 
 // Alt+Enter: windowed <-> the full-screen mode of the settings (Windowed in the settings: borderless).
@@ -94,6 +96,7 @@ int ui_run(void) {
                 host_input_event(&e);
             } while (SDL_PollEvent(&e));
         }
+        diag_watchdog_heartbeat();
         host_input_update();
         cheats_frame();
     }
